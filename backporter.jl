@@ -1,3 +1,6 @@
+# Set the project to the directory of this script.
+# Have pwd() be in the julia repo.
+# Run the script
 import GitHub
 import Dates
 import JSON
@@ -7,20 +10,26 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.0"
+BACKPORT = "1.1"
 if true
-    REPO           = "JuliaLang/julia";
+    REPO = "JuliaLang/julia";
     # where the release branch started
-    START_COMMIT   =  BACKPORT == "1.1" ? "b55b85c" : "5b7e8d9d4e60"
+    START_COMMIT =  
+        BACKPORT == "1.2" ? "8a84ba5" :
+        BACKPORT == "1.1" ? "a84cf6f" :
+        BACKPORT == "1.0" ? "5b7e8d9d4e60" :
+        error()
     # stop looking after encounting PRs opened before this date
-    LIMIT_DATE     = Dates.Date("2018-11-20")
-    # refresh PRs from github
+    LIMIT_DATE     = Dates.Date("2018-12-01")
 else
     REPO           = "JuliaLang/Pkg.jl";
     START_COMMIT   = "5b7e8d9"
     LIMIT_DATE     = Dates.Date("2018-11-20")
 end
-BACKPORT_LABEL = BACKPORT == "1.1" ? "backport 1.1" : "backport 1.0"
+BACKPORT_LABEL = 
+    BACKPORT == "1.2" ? "backport 1.2" :
+    BACKPORT == "1.1" ? "backport 1.1" : 
+    BACKPORT == "1.0" ? "backport 1.0" : error()
 GITHUB_AUTH    = ENV["GITHUB_AUTH"]
 REFRESH_PRS    = false
 
@@ -186,7 +195,6 @@ function do_backporting(refresh_prs = false)
         if pr.commits === nothing
             # When does this happen...
             i = findfirst(x -> x.number == pr.number, label_prs[])
-            @show pr.number
             pr = GitHub.pull_request(REPO, pr.number; auth=getauth())
             @assert pr.commits !== nothing
             label_prs[][i] = pr
