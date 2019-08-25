@@ -10,25 +10,29 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.1"
+BACKPORT = "1.3"
 if true
     REPO = "JuliaLang/julia";
     # where the release branch started
-    START_COMMIT =  
+    START_COMMIT =
+        BACKPORT ==  "1.3" ? "768b25f" :
         BACKPORT == "1.2" ? "8a84ba5" :
         BACKPORT == "1.1" ? "a84cf6f" :
-        BACKPORT == "1.0" ? "5b7e8d9d4e60" :
+        BACKPORT == "1.0" ? "5b7e8d9" :
         error()
     # stop looking after encounting PRs opened before this date
-    LIMIT_DATE     = Dates.Date("2018-12-01")
+    LIMIT_DATE =
+        BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
+        Dates.Date("2018-12-01")
 else
     REPO           = "JuliaLang/Pkg.jl";
     START_COMMIT   = "5b7e8d9"
     LIMIT_DATE     = Dates.Date("2018-11-20")
 end
-BACKPORT_LABEL = 
+BACKPORT_LABEL =
+    BACKPORT == "1.3" ? "backport 1.3" :
     BACKPORT == "1.2" ? "backport 1.2" :
-    BACKPORT == "1.1" ? "backport 1.1" : 
+    BACKPORT == "1.1" ? "backport 1.1" :
     BACKPORT == "1.0" ? "backport 1.0" : error()
 GITHUB_AUTH    = ENV["GITHUB_AUTH"]
 REFRESH_PRS    = false
