@@ -23,7 +23,7 @@ if true
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
         BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
-        Dates.Date("2018-12-01")
+        Dates.Date("2018-08-01")
 else
     REPO           = "JuliaLang/Pkg.jl";
     START_COMMIT   = "5b7e8d9"
