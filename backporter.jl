@@ -10,18 +10,20 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.3"
+BACKPORT = "1.4"
 if true
     REPO = "JuliaLang/julia";
     # where the release branch started
     START_COMMIT =
-        BACKPORT ==  "1.3" ? "768b25f" :
+        BACKPORT == "1.4" ? "4c58369" :
+        BACKPORT == "1.3" ? "768b25f" :
         BACKPORT == "1.2" ? "8a84ba5" :
         BACKPORT == "1.1" ? "a84cf6f" :
         BACKPORT == "1.0" ? "5b7e8d9" :
         error()
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
+        BACKPORT == "1.3" ? Dates.Date("2019-10-01") :
         BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
         Dates.Date("2018-08-01")
 else
@@ -30,6 +32,7 @@ else
     LIMIT_DATE     = Dates.Date("2018-11-20")
 end
 BACKPORT_LABEL =
+    BACKPORT == "1.4" ? "backport 1.4" :
     BACKPORT == "1.3" ? "backport 1.3" :
     BACKPORT == "1.2" ? "backport 1.2" :
     BACKPORT == "1.1" ? "backport 1.1" :
@@ -139,9 +142,6 @@ function collect_label_prs(backport_label::AbstractString)
             for label in pr.labels
                 if label["name"] == backport_label
                     do_backport = true
-                elseif label["name"] == "triage"
-                    do_backport = false
-                    break
                 end
             end
             if do_backport
