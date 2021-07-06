@@ -10,11 +10,12 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.6"
+BACKPORT = "1.7"
 if true
     REPO = "JuliaLang/julia";
     # where the release branch started
     START_COMMIT =
+        BACKPORT == "1.7" ? "a15fbbc80994bac8a79cdb64fe5b0305d98ac3cf" :
         BACKPORT == "1.6" ? "599d329" :
         BACKPORT == "1.5" ? "0c388fc" :
         BACKPORT == "1.4" ? "4c58369" :
@@ -25,6 +26,7 @@ if true
         error()
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
+        BACKPORT == "1.7" ? Dates.Date("2021-05-10") :
         BACKPORT == "1.6" ? Dates.Date("2020-11-10") :
         BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
         BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
@@ -36,6 +38,7 @@ else
     LIMIT_DATE     = Dates.Date("2018-11-20")
 end
 BACKPORT_LABEL =
+    BACKPORT == "1.7" ? "backport 1.7" :
     BACKPORT == "1.6" ? "backport 1.6" :
     BACKPORT == "1.5" ? "backport 1.5" :
     BACKPORT == "1.4" ? "backport 1.4" :
