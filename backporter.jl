@@ -10,7 +10,7 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.7"
+BACKPORT = "1.6"
 if true
     REPO = "JuliaLang/julia";
     # where the release branch started
@@ -26,8 +26,8 @@ if true
         error()
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
-        BACKPORT == "1.7" ? Dates.Date("2021-05-10") :
-        BACKPORT == "1.6" ? Dates.Date("2020-11-10") :
+        BACKPORT == "1.7" ? Dates.Date("2021-07-10") :
+        BACKPORT == "1.6" ? Dates.Date("2021-08-10") :
         BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
         BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
         BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
@@ -278,7 +278,7 @@ function do_backporting(refresh_prs = false)
     println("Update the first post with:")
 
     function summarize_pr(pr; checked=true)
-        println("- [$(checked ? "x" : " ")] #$(pr.number) - $(pr.title)")
+        println("- [$(checked ? "x" : " ")] #$(pr.number)")
     end
 
     backported_prs = [successful_backports; already_backported]
