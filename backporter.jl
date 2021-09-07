@@ -278,7 +278,7 @@ function do_backporting(refresh_prs = false)
     println("Update the first post with:")
 
     function summarize_pr(pr; checked=true)
-        println("- [$(checked ? "x" : " ")] #$(pr.number)")
+        println("- [$(checked ? "x" : " ")] #$(pr.number) <!-- $(pr.title) -->")
     end
 
     backported_prs = [successful_backports; already_backported]
