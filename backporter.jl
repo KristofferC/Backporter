@@ -10,7 +10,7 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.6"
+BACKPORT = "1.7"
 if true
     REPO = "JuliaLang/julia";
     # where the release branch started
@@ -27,7 +27,7 @@ if true
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
         BACKPORT == "1.7" ? Dates.Date("2021-07-10") :
-        BACKPORT == "1.6" ? Dates.Date("2021-08-10") :
+        BACKPORT == "1.6" ? Dates.Date("2021-04-10") :
         BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
         BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
         BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
@@ -171,6 +171,11 @@ if !@isdefined(label_prs)
     const label_prs = Ref{Vector}()
 end
 
+function is_ci_noise(pr)
+    title = pr.title
+    return any(x -> occursin(x, pr.title), ["CI", "Buildkite", "GHA", "Buildbot"])
+end
+
 function do_backporting(refresh_prs = false)
     if !isassigned(label_prs) || refresh_prs
         empty!(sha_to_pr)
@@ -229,7 +234,7 @@ function do_backporting(refresh_prs = false)
     # Actions to take:
     remove_label_prs = [closed_prs; already_backported]
     if !isempty(remove_label_prs)
-	for ppr in remove_label_prs
+    for ppr in remove_label_prs
            if ppr.merged_at == nothing
                @show ppr
            end
@@ -286,8 +291,23 @@ function do_backporting(refresh_prs = false)
         sort!(backported_prs; by = x -> x.merged_at)
         println("Backported PRs:")
         for pr in backported_prs
-            summarize_pr(pr)
+            if !is_ci_noise(pr)
+                summarize_pr(pr)
+            end
         end
+
+        println("""
+
+
+        <details>
+        <summary>Backported CI PRs:</summary>
+        """)
+        for pr in backported_prs
+            if is_ci_noise(pr)
+                summarize_pr(pr)
+            end
+        end
+        println("</details>")
     end
 
     if !isempty(failed_backports)
