@@ -26,8 +26,8 @@ if true
         error()
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
-        BACKPORT == "1.7" ? Dates.Date("2021-07-10") :
-        BACKPORT == "1.6" ? Dates.Date("2021-08-10") :
+        BACKPORT == "1.7" ? Dates.Date("2021-11-10") :
+        BACKPORT == "1.6" ? Dates.Date("2021-04-10") :
         BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
         BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
         BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
