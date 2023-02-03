@@ -10,11 +10,13 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.6"
+BACKPORT = "1.9"
 if true
     REPO = "JuliaLang/julia";
     # where the release branch started
     START_COMMIT =
+        BACKPORT == "1.9" ? "0540f9d7394c0f0dc2690a57da914b33b636211c" :
+        BACKPORT == "1.8" ? "7a1c20e6dea50291b364452996d3d4d71a6133dc" :
         BACKPORT == "1.7" ? "a15fbbc80994bac8a79cdb64fe5b0305d98ac3cf" :
         BACKPORT == "1.6" ? "599d329" :
         BACKPORT == "1.5" ? "0c388fc" :
@@ -26,6 +28,8 @@ if true
         error()
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
+        BACKPORT == "1.9" ? Dates.Date("2022-03-01") :
+        BACKPORT == "1.8" ? Dates.Date("2022-01-01") :
         BACKPORT == "1.7" ? Dates.Date("2021-11-10") :
         BACKPORT == "1.6" ? Dates.Date("2021-04-10") :
         BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
@@ -34,10 +38,12 @@ if true
         Dates.Date("2018-08-01")
 else
     REPO           = "JuliaLang/Pkg.jl";
-    START_COMMIT   = "5b7e8d9"
-    LIMIT_DATE     = Dates.Date("2018-11-20")
+    START_COMMIT   = "e31a3dc77201e1c7c4"
+    LIMIT_DATE     = Dates.Date("2022-01-01")
 end
 BACKPORT_LABEL =
+    BACKPORT == "1.9" ? "backport 1.9" :
+    BACKPORT == "1.8" ? "backport 1.8" :
     BACKPORT == "1.7" ? "backport 1.7" :
     BACKPORT == "1.6" ? "backport 1.6" :
     BACKPORT == "1.5" ? "backport 1.5" :
@@ -149,7 +155,7 @@ function collect_label_prs(backport_label::AbstractString)
         for pr in prs
             do_backport = false
             for label in pr.labels
-                if label["name"] == backport_label
+                if label.name == backport_label
                     do_backport = true
                 end
             end
