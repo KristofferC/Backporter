@@ -50,6 +50,7 @@ else
     error("pwd ($(pwd())) is not recognized to be the julia or Pkg repo")
 end
 BACKPORT_LABEL =
+    BACKPORT == "1.10" ? "backport 1.10" :
     BACKPORT == "1.9" ? "backport 1.9" :
     BACKPORT == "1.8" ? "backport 1.8" :
     BACKPORT == "1.7" ? "backport 1.7" :
