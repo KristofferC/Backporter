@@ -1,5 +1,7 @@
 # Set the project to the directory of this script.
 # Have pwd() be in the julia (or Pkg) repo.
+# Update BACKPORT below
+# Make and checkout a new backport branch (backports-release-1.9 etc.)
 # make sure github token is provided via ENV["GITHUB_AUTH"]
 # Run the script
 
