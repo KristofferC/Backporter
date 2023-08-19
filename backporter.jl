@@ -49,7 +49,7 @@ if foldername == "julia"
 elseif foldername in ("Pkg.jl", "Pkg")
     REPO           = "JuliaLang/Pkg.jl";
     START_COMMIT   = "e31a3dc77201e1c7c4"
-    LIMIT_DATE     = Dates.Date("2022-01-01")
+    LIMIT_DATE     = Dates.Date("2020-01-01")
 else
     error("pwd ($(pwd())) is not recognized to be the julia or Pkg repo")
 end
