@@ -23,6 +23,7 @@ if foldername == "julia"
     REPO = "JuliaLang/julia";
     # where the release branch started
     START_COMMIT =
+        BACKPORT == "1.10" ? "9b20acac2069c8a374c89c89acd15f20d0f2a7ae" :
         BACKPORT == "1.9" ? "0540f9d7394c0f0dc2690a57da914b33b636211c" :
         BACKPORT == "1.8" ? "7a1c20e6dea50291b364452996d3d4d71a6133dc" :
         BACKPORT == "1.7" ? "a15fbbc80994bac8a79cdb64fe5b0305d98ac3cf" :
@@ -36,6 +37,7 @@ if foldername == "julia"
         error()
     # stop looking after encounting PRs opened before this date
     LIMIT_DATE =
+        BACKPORT == "1.10" ? Dates.Date("2022-11-14") :
         BACKPORT == "1.9" ? Dates.Date("2022-03-01") :
         BACKPORT == "1.8" ? Dates.Date("2022-01-01") :
         BACKPORT == "1.7" ? Dates.Date("2021-11-10") :
