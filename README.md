@@ -4,7 +4,7 @@
 
 ```bash
 cd /some/path/
-git clone https://github.com/KristofferC/Backporter.gir
+git clone https://github.com/KristofferC/Backporter.git
 
 cd /other/path/
 git clone git@github.com:JuliaLang/julia.git
