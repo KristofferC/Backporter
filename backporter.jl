@@ -1,6 +1,13 @@
 # Set the project to the directory of this script.
-# Have pwd() be in the julia repo.
+# Have pwd() be in the julia (or Pkg) repo.
+# Update BACKPORT below
+# Make and checkout a new backport branch (backports-release-1.9 etc.)
+# make sure github token is provided via ENV["GITHUB_AUTH"]
 # Run the script
+
+import Pkg
+Pkg.instantiate()
+
 import GitHub
 import Dates
 import JSON
@@ -11,7 +18,8 @@ import HTTP
 ############
 
 BACKPORT = "1.9"
-if true
+foldername = basename(pwd())
+if foldername == "julia"
     REPO = "JuliaLang/julia";
     # where the release branch started
     START_COMMIT =
@@ -36,12 +44,15 @@ if true
         BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
         BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
         Dates.Date("2018-08-01")
-else
+elseif foldername in ("Pkg.jl", "Pkg")
     REPO           = "JuliaLang/Pkg.jl";
     START_COMMIT   = "e31a3dc77201e1c7c4"
     LIMIT_DATE     = Dates.Date("2022-01-01")
+else
+    error("pwd ($(pwd())) is not recognized to be the julia or Pkg repo")
 end
 BACKPORT_LABEL =
+    BACKPORT == "1.10" ? "backport 1.10" :
     BACKPORT == "1.9" ? "backport 1.9" :
     BACKPORT == "1.8" ? "backport 1.8" :
     BACKPORT == "1.7" ? "backport 1.7" :
