@@ -4,9 +4,7 @@
 
 ```bash
 cd /some/path/
-git clone https://github.com/KristofferC/Backporter.git
-
-JULIA_LOAD_PATH="@:@stdlib" julia --project=/some/path/Backporter -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
+git clone https://github.com/KristofferC/Backporter.gi
 
 cd /other/path/
 git clone git@github.com:JuliaLang/julia.git
@@ -37,5 +35,5 @@ git checkout -b "backports-release-${BACKPORTER_SCRIPT_TARGET_VERSION:?}"
 
 export GITHUB_AUTH="pasteyourtokenhere"
 
-JULIA_LOAD_PATH="@" julia --project=/some/path/Backporter /some/path/Backporter/backporter.jl
+JULIA_LOAD_PATH="@:@stdlib" julia --project=/some/path/Backporter /some/path/Backporter/backporter.jl
 ```
