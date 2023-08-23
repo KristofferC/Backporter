@@ -17,7 +17,7 @@ import HTTP
 # Settings #
 ############
 
-BACKPORT = "1.9"
+BACKPORT = strip(get(ENV, "BACKPORTER_SCRIPT_TARGET_VERSION", "1.9"))
 foldername = basename(pwd())
 if foldername == "julia"
     REPO = "JuliaLang/julia";
