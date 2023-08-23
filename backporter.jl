@@ -5,7 +5,7 @@
 # make sure github token is provided via ENV["GITHUB_AUTH"]
 # Run the script
 
-if isempty(strip(get(ENV, "GITHUB_AUTH", "")])
+if isempty(strip(get(ENV, "GITHUB_AUTH", "")))
     error("You need to provide the GitHub token in GITHUB_AUTH")
 end
 
