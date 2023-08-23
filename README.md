@@ -31,7 +31,7 @@ export BACKPORT_VERSION="1.9"
 git checkout "release-${BACKPORT_VERSION:?}"
 
 # The `-b` flag will create the branch only if it doesn't already exist.
-git checkout -b "backports-release-${BACKPORTER_SCRIPT_TARGET_VERSION:?}"
+git checkout -b "backports-release-${BACKPORT_VERSION:?}"
 
 export GITHUB_AUTH="pasteyourtokenhere"
 
