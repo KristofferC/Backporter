@@ -26,9 +26,9 @@ cd /other/path/julia
 # cd /other/path/SparseArrays
 
 # Set this to the appropiate value.
-export BACKPORTER_SCRIPT_TARGET_VERSION="1.9"
+export BACKPORT_VERSION="1.9"
 
-git checkout "release-${BACKPORTER_SCRIPT_TARGET_VERSION:?}"
+git checkout "release-${BACKPORT_VERSION:?}"
 
 # The `-b` flag will create the branch only if it doesn't already exist.
 git checkout -b "backports-release-${BACKPORTER_SCRIPT_TARGET_VERSION:?}"
