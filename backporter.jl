@@ -5,6 +5,10 @@
 # make sure github token is provided via ENV["GITHUB_AUTH"]
 # Run the script
 
+if isempty(strip(get(ENV, "GITHUB_AUTH", "")])
+    error("You need to provide the GitHub token in GITHUB_AUTH")
+end
+
 import Pkg
 Pkg.instantiate()
 
@@ -35,7 +39,7 @@ if foldername == "julia"
         BACKPORT == "1.1" ? "a84cf6f" :
         BACKPORT == "1.0" ? "5b7e8d9" :
         error()
-    # stop looking after encounting PRs opened before this date
+    # stop looking after encountering PRs opened before this date
     LIMIT_DATE =
         BACKPORT == "1.10" ? Dates.Date("2022-11-14") :
         BACKPORT == "1.9" ? Dates.Date("2022-03-01") :
@@ -50,8 +54,17 @@ elseif foldername in ("Pkg.jl", "Pkg")
     REPO           = "JuliaLang/Pkg.jl";
     START_COMMIT   = "e31a3dc77201e1c7c4"
     LIMIT_DATE     = Dates.Date("2020-01-01")
+elseif foldername in ("SparseArrays.jl", "SparseArrays")
+    REPO           = "JuliaSparse/SparseArrays.jl";
+    START_COMMIT   = "8affe9e499379616e33fc60a24bb31500e8423d7"
+    LIMIT_DATE     = Dates.Date("2020-01-01")
 else
-    error("pwd ($(pwd())) is not recognized to be the julia or Pkg repo")
+    supported_list = [
+        "julia",
+        "Pkg.jl",
+        "SparseArrays.jl",
+    ]
+    error("pwd ($(pwd())) is not in the supported list: $(supported_list)")
 end
 BACKPORT_LABEL =
     BACKPORT == "1.10" ? "backport 1.10" :
