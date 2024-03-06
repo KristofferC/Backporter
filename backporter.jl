@@ -12,68 +12,26 @@ import GitHub
 import Dates
 import JSON
 import HTTP
-
+import URIs
+using Dates: now
 ############
 # Settings #
 ############
 
-BACKPORT = "1.9"
-foldername = basename(pwd())
-if foldername == "julia"
-    REPO = "JuliaLang/julia";
-    # where the release branch started
-    START_COMMIT =
-        BACKPORT == "1.10" ? "9b20acac2069c8a374c89c89acd15f20d0f2a7ae" :
-        BACKPORT == "1.9" ? "0540f9d7394c0f0dc2690a57da914b33b636211c" :
-        BACKPORT == "1.8" ? "7a1c20e6dea50291b364452996d3d4d71a6133dc" :
-        BACKPORT == "1.7" ? "a15fbbc80994bac8a79cdb64fe5b0305d98ac3cf" :
-        BACKPORT == "1.6" ? "599d329" :
-        BACKPORT == "1.5" ? "0c388fc" :
-        BACKPORT == "1.4" ? "4c58369" :
-        BACKPORT == "1.3" ? "768b25f" :
-        BACKPORT == "1.2" ? "8a84ba5" :
-        BACKPORT == "1.1" ? "a84cf6f" :
-        BACKPORT == "1.0" ? "5b7e8d9" :
-        error()
-    # stop looking after encounting PRs opened before this date
-    LIMIT_DATE =
-        BACKPORT == "1.10" ? Dates.Date("2022-11-14") :
-        BACKPORT == "1.9" ? Dates.Date("2022-03-01") :
-        BACKPORT == "1.8" ? Dates.Date("2022-01-01") :
-        BACKPORT == "1.7" ? Dates.Date("2021-11-10") :
-        BACKPORT == "1.6" ? Dates.Date("2021-04-10") :
-        BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
-        BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
-        BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
-        Dates.Date("2018-08-01")
-elseif foldername in ("Pkg.jl", "Pkg")
-    REPO           = "JuliaLang/Pkg.jl";
-    START_COMMIT   = "e31a3dc77201e1c7c4"
-    LIMIT_DATE     = Dates.Date("2020-01-01")
-else
-    error("pwd ($(pwd())) is not recognized to be the julia or Pkg repo")
-end
-BACKPORT_LABEL =
-    BACKPORT == "1.10" ? "backport 1.10" :
-    BACKPORT == "1.9" ? "backport 1.9" :
-    BACKPORT == "1.8" ? "backport 1.8" :
-    BACKPORT == "1.7" ? "backport 1.7" :
-    BACKPORT == "1.6" ? "backport 1.6" :
-    BACKPORT == "1.5" ? "backport 1.5" :
-    BACKPORT == "1.4" ? "backport 1.4" :
-    BACKPORT == "1.3" ? "backport 1.3" :
-    BACKPORT == "1.2" ? "backport 1.2" :
-    BACKPORT == "1.1" ? "backport 1.1" :
-    BACKPORT == "1.0" ? "backport 1.0" : error()
+BACKPORT       = "1.11"
+REPO           = "JuliaLang/julia";
+BACKPORT_LABEL = "backport $BACKPORT"
 GITHUB_AUTH    = ENV["GITHUB_AUTH"]
-REFRESH_PRS    = false
 
 ########################################
 # Git executable convenience functions #
 ########################################
-function cherry_picked_commits(start_commit::AbstractString)
+function cherry_picked_commits(version)
     commits = Set{String}()
-    logg = read(`git log $start_commit..HEAD`, String)
+
+    base = "release-$version"
+    against = "backports-release-$version"
+    logg = read(`git log $base...$against`, String)
     for match in eachmatch(r"\(cherry picked from commit (.*?)\)", logg)
         push!(commits, match.captures[1])
     end
@@ -152,57 +110,47 @@ function getauth()
 end
 
 function collect_label_prs(backport_label::AbstractString)
-    # What are good parameters...?
-    myparams = Dict("state" => "all", "per_page" => 20, "page" => 1);
-    label_prs = []
-    i = 1
-    print("Collecting PRs...")
-    first = true
-    local page_data
+    prs = []
+    page = 1
     while true
-        print(".")
-        prs, page_data = GitHub.pull_requests(REPO;
-            page_limit = 1, auth=getauth(),
-            (first ? (params = myparams,) : (start_page = page_data["next"],))...)
-        first = false
-        for pr in prs
-            do_backport = false
-            for label in pr.labels
-                if label.name == backport_label
-                    do_backport = true
-                end
-            end
-            if do_backport
-                push!(label_prs, pr)
-            end
-            if pr.created_at < LIMIT_DATE
-                return label_prs
-            end
+        backport_label = replace(backport_label, " " => "+")
+        # Ensure the $REPO variable is correctly defined and interpolated here
+        query = "repo:$REPO+is:pr+label:%22$backport_label%22"
+        search_url = "https://api.github.com/search/issues?q=$query&per_page=100&page=$page"
+        headers = Dict("Authorization" => "token $GITHUB_AUTH")
+
+        response = HTTP.get(search_url, headers=headers)
+        if response.status != 200
+            error("Failed to fetch PRs: $(response.body)")
         end
-        haskey(page_data, "next") || break
+        data = JSON.parse(String(response.body))
+        append!(prs, data["items"])
+
+        # Check if there are more pages
+        if !haskey(data, "items") || isempty(data["items"])
+            break
+        end
+        page += 1
     end
-    println()
-    return label_prs
-end
 
-
-if !@isdefined(label_prs)
-    const label_prs = Ref{Vector}()
+    # Filter and map to your desired structure if necessary
+    # This is slow...
+    return map(pr -> GitHub.pull_request(REPO, pr["number"]), prs)
 end
 
 function do_backporting(refresh_prs = false)
-    if !isassigned(label_prs) || refresh_prs
-        empty!(sha_to_pr)
-        label_prs[] = collect_label_prs(BACKPORT_LABEL)
-    end
-    already_backported_commits = cherry_picked_commits(START_COMMIT)
-    release_branch = branch()
+    label_prs = collect_label_prs(BACKPORT_LABEL)
+    _do_backporting(label_prs)
+end
+
+function _do_backporting(prs)
+    # Get from release branch
+    already_backported_commits = cherry_picked_commits(BACKPORT)
     open_prs = []
-    multi_commits = []
     closed_prs = []
     already_backported = []
     backport_candidates = []
-    for pr in label_prs[]
+    for pr in prs
         if pr.state != "closed"
             push!(open_prs, pr)
         else
@@ -226,10 +174,10 @@ function do_backporting(refresh_prs = false)
     for pr in backport_candidates
         if pr.commits === nothing
             # When does this happen...
-            i = findfirst(x -> x.number == pr.number, label_prs[])
+            i = findfirst(x -> x.number == pr.number, prs)
             pr = GitHub.pull_request(REPO, pr.number; auth=getauth())
             @assert pr.commits !== nothing
-            label_prs[][i] = pr
+            prs[i] = pr
         end
         if pr.commits != 1
             # Check if this was squashed, in that case we can still backport
@@ -246,14 +194,10 @@ function do_backporting(refresh_prs = false)
     end
 
     # Actions to take:
+
     remove_label_prs = [closed_prs; already_backported]
     if !isempty(remove_label_prs)
-	for ppr in remove_label_prs
-           if ppr.merged_at == nothing
-               @show ppr
-           end
-        end
-        sort!(remove_label_prs; by = x -> x.merged_at)
+        sort!(remove_label_prs; by = x -> (x.merged_at == nothing ? now() : x.merged_at))
         println("The following PRs are closed or already backported but still has a backport label, remove the label:")
         for pr in remove_label_prs
             println("    #$(pr.number) - $(pr.html_url)")
@@ -334,4 +278,5 @@ function do_backporting(refresh_prs = false)
     end
 end
 
-do_backporting(REFRESH_PRS)
+prs = collect_label_prs(BACKPORT_LABEL)
+_do_backporting(prs)
