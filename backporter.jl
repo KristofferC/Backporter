@@ -135,7 +135,7 @@ function collect_label_prs(backport_label::AbstractString)
 
     # Filter and map to your desired structure if necessary
     # This is slow...
-    return map(pr -> GitHub.pull_request(REPO, pr["number"]), prs)
+    return map(pr -> GitHub.pull_request(REPO, pr["number"]; auth=getauth()), prs)
 end
 
 function do_backporting(refresh_prs = false)
