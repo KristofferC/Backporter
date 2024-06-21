@@ -5,6 +5,10 @@
 # make sure github token is provided via ENV["GITHUB_AUTH"]
 # Run the script
 
+if isempty(strip(get(ENV, "GITHUB_AUTH", "")))
+    error("You need to provide the GitHub token in GITHUB_AUTH")
+end
+
 import Pkg
 Pkg.instantiate()
 
@@ -18,9 +22,64 @@ using Dates: now
 # Settings #
 ############
 
-BACKPORT       = "1.11"
-REPO           = "JuliaLang/julia";
-BACKPORT_LABEL = "backport $BACKPORT"
+BACKPORT = "1.11"
+foldername = basename(pwd())
+if foldername == "julia"
+    REPO = "JuliaLang/julia";
+    # where the release branch started
+    START_COMMIT =
+        BACKPORT == "1.10" ? "9b20acac2069c8a374c89c89acd15f20d0f2a7ae" :
+        BACKPORT == "1.9" ? "0540f9d7394c0f0dc2690a57da914b33b636211c" :
+        BACKPORT == "1.8" ? "7a1c20e6dea50291b364452996d3d4d71a6133dc" :
+        BACKPORT == "1.7" ? "a15fbbc80994bac8a79cdb64fe5b0305d98ac3cf" :
+        BACKPORT == "1.6" ? "599d329" :
+        BACKPORT == "1.5" ? "0c388fc" :
+        BACKPORT == "1.4" ? "4c58369" :
+        BACKPORT == "1.3" ? "768b25f" :
+        BACKPORT == "1.2" ? "8a84ba5" :
+        BACKPORT == "1.1" ? "a84cf6f" :
+        BACKPORT == "1.0" ? "5b7e8d9" :
+        error()
+    # stop looking after encountering PRs opened before this date
+    LIMIT_DATE =
+        BACKPORT == "1.10" ? Dates.Date("2022-11-14") :
+        BACKPORT == "1.9" ? Dates.Date("2022-03-01") :
+        BACKPORT == "1.8" ? Dates.Date("2022-01-01") :
+        BACKPORT == "1.7" ? Dates.Date("2021-11-10") :
+        BACKPORT == "1.6" ? Dates.Date("2021-04-10") :
+        BACKPORT == "1.5" ? Dates.Date("2020-05-01") :
+        BACKPORT == "1.4" ? Dates.Date("2019-10-01") :
+        BACKPORT == "1.3" ? Dates.Date("2019-07-01") :
+        Dates.Date("2018-08-01")
+elseif foldername in ("Pkg.jl", "Pkg")
+    REPO           = "JuliaLang/Pkg.jl";
+    START_COMMIT   = "e31a3dc77201e1c7c4"
+    LIMIT_DATE     = Dates.Date("2020-01-01")
+elseif foldername in ("SparseArrays.jl", "SparseArrays")
+    REPO           = "JuliaSparse/SparseArrays.jl";
+    START_COMMIT   = "8affe9e499379616e33fc60a24bb31500e8423d7"
+    LIMIT_DATE     = Dates.Date("2020-01-01")
+else
+    supported_list = [
+        "julia",
+        "Pkg.jl",
+        "SparseArrays.jl",
+    ]
+    error("pwd ($(pwd())) is not in the supported list: $(supported_list)")
+end
+BACKPORT_LABEL =
+    BACKPORT == "1.10" ? "backport 1.10" :
+    BACKPORT == "1.9" ? "backport 1.9" :
+    BACKPORT == "1.8" ? "backport 1.8" :
+    BACKPORT == "1.7" ? "backport 1.7" :
+    BACKPORT == "1.6" ? "backport 1.6" :
+    BACKPORT == "1.5" ? "backport 1.5" :
+    BACKPORT == "1.4" ? "backport 1.4" :
+    BACKPORT == "1.3" ? "backport 1.3" :
+    BACKPORT == "1.2" ? "backport 1.2" :
+    BACKPORT == "1.1" ? "backport 1.1" :
+    BACKPORT == "1.0" ? "backport 1.0" : error()
+
 GITHUB_AUTH    = ENV["GITHUB_AUTH"]
 
 ########################################
