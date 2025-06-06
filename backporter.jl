@@ -18,8 +18,8 @@ using Dates: now
 # Settings #
 ############
 
-BACKPORT       = "1.11"
-REPO           = "JuliaLang/julia";
+BACKPORT       = "1.12"
+REPO           = "JuliaLang/LinearAlgebra.jl";
 BACKPORT_LABEL = "backport $BACKPORT"
 GITHUB_AUTH    = ENV["GITHUB_AUTH"]
 
