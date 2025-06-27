@@ -24,15 +24,14 @@ struct BackportConfig
     repo::String
     backport_label::String
     github_auth::String
-    
-    function BackportConfig(backport_version::String, repo::String="JuliaLang/julia")
-        github_auth = get(ENV, "GITHUB_AUTH", "")
-        if isempty(github_auth)
-            error("GITHUB_AUTH environment variable must be set")
-        end
-        backport_label = "backport $backport_version"
-        new(backport_version, repo, backport_label, github_auth)
+end
+function BackportConfig(backport_version::String, repo::String="JuliaLang/julia")
+    github_auth = get(ENV, "GITHUB_AUTH", "")
+    if isempty(github_auth)
+        error("GITHUB_AUTH environment variable must be set")
     end
+    backport_label = "backport $backport_version"
+    BackportConfig(backport_version, repo, backport_label, github_auth)
 end
 
 # Default configuration - will be replaced by CLI args later
@@ -113,9 +112,8 @@ end
 struct BackportCache
     sha_to_pr::Dict{String, Int}
     pr_cache::Dict{Int, Any}  # Cache PR objects to avoid refetching
-    
-    BackportCache() = new(Dict{String, Int}(), Dict{Int, Any}())
 end
+BackportCache() = BackportCache(Dict{String, Int}(), Dict{Int, Any}())
 
 const CACHE = BackportCache()
 
@@ -169,9 +167,8 @@ end
 ##################
 struct GitHubAuthenticator
     auth::Ref{GitHub.Authorization}
-    
-    GitHubAuthenticator() = new(Ref{GitHub.Authorization}())
 end
+GitHubAuthenticator() = GitHubAuthenticator(Ref{GitHub.Authorization}())
 
 function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfig)
     if !isassigned(authenticator.auth)
