@@ -365,20 +365,48 @@ function collect_label_prs(config::BackportConfig, cache::BackportCache, auth::G
     # Filter and map to your desired structure if necessary
     println("Fetching detailed PR information for $(length(prs)) PRs...")
     
-    # Fetch detailed PR information with caching
-    detailed_prs = []
-    for pr_item in prs
+    # Fetch detailed PR information with caching and parallelization
+    detailed_prs = Vector{Any}(undef, length(prs))
+    uncached_indices = Int[]
+    uncached_numbers = Int[]
+    
+    # First pass: collect cached PRs and identify uncached ones
+    for (i, pr_item) in enumerate(prs)
         pr_number = pr_item["number"]
         if haskey(cache.pr_cache, pr_number)
-            push!(detailed_prs, cache.pr_cache[pr_number])
+            detailed_prs[i] = cache.pr_cache[pr_number]
         else
-            detailed_pr = GitHub.pull_request(config.repo, pr_number; auth=authenticate!(auth, config))
-            cache.pr_cache[pr_number] = detailed_pr
-            push!(detailed_prs, detailed_pr)
+            push!(uncached_indices, i)
+            push!(uncached_numbers, pr_number)
         end
     end
     
-    return detailed_prs
+    if !isempty(uncached_numbers)
+        println("Fetching $(length(uncached_numbers)) uncached PRs in parallel...")
+        
+        # Fetch uncached PRs in parallel using asyncmap
+        auth_ref = authenticate!(auth, config)
+        @time fetched_prs = asyncmap(uncached_numbers; ntasks=min(20, length(uncached_numbers))) do pr_number
+            try
+                GitHub.pull_request(config.repo, pr_number; auth=auth_ref)
+            catch e
+                @warn "Failed to fetch PR #$pr_number: $e"
+                nothing
+            end
+        end
+        
+        # Store results in cache and detailed_prs array
+        for (idx, pr) in zip(uncached_indices, fetched_prs)
+            if pr !== nothing
+                pr_number = uncached_numbers[idx - uncached_indices[1] + 1]
+                cache.pr_cache[pr_number] = pr
+                detailed_prs[idx] = pr
+            end
+        end
+    end
+    
+    # Filter out any failed fetches
+    return filter(pr -> pr !== nothing, detailed_prs)
 end
 
 function do_backporting(config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
