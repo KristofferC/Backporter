@@ -393,7 +393,7 @@ function main()
     println("====================")
     
     # Validate environment
-    if !isdir(".git")
+    if !ispath(".git")
         error("This script must be run from the root of a git repository")
     end
     
