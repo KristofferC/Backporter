@@ -1,4 +1,4 @@
-#!/usr/bin/env -S julia --project
+#!/usr/bin/env -S julia  
 """
 Julia Backporter Tool
 
@@ -7,6 +7,11 @@ Automatically detects target version and repository from git context.
 
 Requires GITHUB_AUTH environment variable to be set.
 """
+
+# Activate the project environment in the script's directory (resolve symlinks)
+import Pkg
+script_dir = dirname(realpath(@__FILE__))
+Pkg.activate(script_dir)
 
 import GitHub
 import Dates
@@ -25,7 +30,7 @@ struct BackportConfig
     backport_label::String
     github_auth::String
 end
-function BackportConfig(backport_version::String, repo::String="JuliaLang/julia")
+function BackportConfig(backport_version::AbstractString, repo::AbstractString="JuliaLang/julia")
     github_auth = get(ENV, "GITHUB_AUTH", "")
     if isempty(github_auth)
         error("GITHUB_AUTH environment variable must be set")
@@ -560,7 +565,7 @@ function _do_backporting(prs, config::BackportConfig, cache::BackportCache, auth
     end
 end
 
-function (@main)(args)
+function main(args)
     # Parse command line arguments
     options = parse_cli_args(args)
     
@@ -626,3 +631,5 @@ function (@main)(args)
         error("Backporting failed: $e")
     end
 end
+
+main(ARGS)
