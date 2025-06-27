@@ -14,32 +14,66 @@ import JSON
 import HTTP
 import URIs
 using Dates: now
+
 ############
 # Settings #
 ############
 
-BACKPORT       = "1.11"
-REPO           = "JuliaLang/julia";
-BACKPORT_LABEL = "backport $BACKPORT"
-GITHUB_AUTH    = ENV["GITHUB_AUTH"]
+struct BackportConfig
+    backport_version::String
+    repo::String
+    backport_label::String
+    github_auth::String
+    
+    function BackportConfig(backport_version::String, repo::String="JuliaLang/julia")
+        github_auth = get(ENV, "GITHUB_AUTH", "")
+        if isempty(github_auth)
+            error("GITHUB_AUTH environment variable must be set")
+        end
+        backport_label = "backport $backport_version"
+        new(backport_version, repo, backport_label, github_auth)
+    end
+end
+
+# Default configuration - will be replaced by CLI args later
+const DEFAULT_CONFIG = BackportConfig("1.12")
 
 ########################################
 # Git executable convenience functions #
 ########################################
 function cherry_picked_commits(version)
     commits = Set{String}()
-
+    
     base = "release-$version"
     against = "backports-release-$version"
-    logg = read(`git log $base...$against`, String)
-    for match in eachmatch(r"\(cherry picked from commit (.*?)\)", logg)
-        push!(commits, match.captures[1])
+    
+    # Check if branches exist
+    if !success(`git rev-parse --verify $base`)
+        error("Base branch '$base' does not exist")
+    end
+    if !success(`git rev-parse --verify $against`)
+        error("Target branch '$against' does not exist")
+    end
+    
+    try
+        logg = read(`git log $base...$against`, String)
+        for match in eachmatch(r"\(cherry picked from commit (.*?)\)", logg)
+            push!(commits, match.captures[1])
+        end
+    catch e
+        error("Failed to get git log between $base and $against: $e")
     end
     return commits
 end
 
-get_parents(hash::AbstractString) =
-    return split(chomp(read(`git rev-list --parents -n 1 $hash`, String)))[2:end]
+function get_parents(hash::AbstractString)
+    try
+        result = read(`git rev-list --parents -n 1 $hash`, String)
+        return split(chomp(result))[2:end]
+    catch e
+        error("Failed to get parents for commit $hash: $e")
+    end
+end
 
 function get_real_hash(hash::AbstractString)
     # check if it is a merge commit
@@ -51,101 +85,171 @@ function get_real_hash(hash::AbstractString)
 end
 
 function try_cherry_pick(hash::AbstractString)
+    # Ensure we have a clean working directory
+    if !success(`git diff --quiet`)
+        error("Working directory is not clean. Please commit or stash changes before cherry-picking.")
+    end
+    
     if !success(`git cherry-pick -x $hash`)
-        read(`git cherry-pick --abort`)
+        try
+            read(`git cherry-pick --abort`)
+        catch e
+            @warn "Failed to abort cherry-pick: $e"
+        end
         return false
     end
     return true
 end
 
-branch() = chomp(String(read(`git rev-parse --abbrev-ref HEAD`)))
-
-if !@isdefined(sha_to_pr)
-    const sha_to_pr = Dict{String, Int}()
+function branch()
+    try
+        return chomp(String(read(`git rev-parse --abbrev-ref HEAD`)))
+    catch e
+        error("Failed to get current branch: $e")
+    end
 end
 
-function find_pr_associated_with_commit(hash::AbstractString)
-    if haskey(sha_to_pr, hash)
-        return sha_to_pr[hash]
-    end
-    headers = Dict()
-    GitHub.authenticate_headers!(headers, getauth())
-    headers["User-Agent"] = "GitHub-jl"
-    req = HTTP.request("GET", "https://api.github.com/search/issues?q=$hash+type:pr+repo:$REPO";
-                 headers = headers)
-    json = JSON.parse(String(req.body))
-    if json["total_count"] !== 1
-        return nothing
-    end
-    item = json["items"][1]
-    if !haskey(item, "pull_request")
-        return nothing
-    end
-
-    pr = parse(Int, basename(item["pull_request"]["url"]))
-    sha_to_pr[hash] = pr
-    return pr
+# Cache for performance improvements
+struct BackportCache
+    sha_to_pr::Dict{String, Int}
+    pr_cache::Dict{Int, Any}  # Cache PR objects to avoid refetching
+    
+    BackportCache() = new(Dict{String, Int}(), Dict{Int, Any}())
 end
 
-function was_squashed_pr(pr)
+const CACHE = BackportCache()
+
+function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig)
+    if haskey(CACHE.sha_to_pr, hash)
+        return CACHE.sha_to_pr[hash]
+    end
+    
+    try
+        headers = Dict()
+        GitHub.authenticate_headers!(headers, authenticate!(GITHUB_AUTH, config))
+        headers["User-Agent"] = "GitHub-jl"
+        
+        req = HTTP.request("GET", "https://api.github.com/search/issues?q=$hash+type:pr+repo:$(config.repo)";
+                     headers = headers, connect_timeout=30, read_timeout=60)
+        
+        if req.status != 200
+            @warn "GitHub API request failed with status $(req.status)"
+            return nothing
+        end
+        
+        json = JSON.parse(String(req.body))
+        if json["total_count"] !== 1
+            return nothing
+        end
+        item = json["items"][1]
+        if !haskey(item, "pull_request")
+            return nothing
+        end
+
+        pr = parse(Int, basename(item["pull_request"]["url"]))
+        CACHE.sha_to_pr[hash] = pr
+        return pr
+    catch e
+        @warn "Failed to find PR for commit $hash: $e"
+        return nothing
+    end
+end
+
+function was_squashed_pr(pr, config::BackportConfig)
     parents = get_parents(pr.merge_commit_sha)
     if length(parents) != 1
         return false
     end
-    return pr.number != find_pr_associated_with_commit(parents[1])
+    return pr.number != find_pr_associated_with_commit(parents[1], config)
 end
 
 
 ##################
 # Main functions #
 ##################
-if !@isdefined(__myauth)
-    const __myauth = Ref{GitHub.Authorization}()
-end
-function getauth()
-    if !isassigned(__myauth)
-        __myauth[] = GitHub.authenticate(GITHUB_AUTH)
-    end
-    return __myauth[]
+struct GitHubAuthenticator
+    auth::Ref{GitHub.Authorization}
+    
+    GitHubAuthenticator() = new(Ref{GitHub.Authorization}())
 end
 
-function collect_label_prs(backport_label::AbstractString)
+function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfig)
+    if !isassigned(authenticator.auth)
+        try
+            authenticator.auth[] = GitHub.authenticate(config.github_auth)
+        catch e
+            error("Failed to authenticate with GitHub: $e. Please check your GITHUB_AUTH token.")
+        end
+    end
+    return authenticator.auth[]
+end
+
+# Global authenticator instance
+const GITHUB_AUTH = GitHubAuthenticator()
+
+function collect_label_prs(config::BackportConfig)
     prs = []
     page = 1
+    backport_label_encoded = replace(config.backport_label, " " => "+")
+    
     while true
-        backport_label = replace(backport_label, " " => "+")
-        # Ensure the $REPO variable is correctly defined and interpolated here
-        query = "repo:$REPO+is:pr+label:%22$backport_label%22"
+        query = "repo:$(config.repo)+is:pr+label:%22$backport_label_encoded%22"
         search_url = "https://api.github.com/search/issues?q=$query&per_page=100&page=$page"
-        headers = Dict("Authorization" => "token $GITHUB_AUTH")
+        headers = Dict("Authorization" => "token $(config.github_auth)")
 
-        response = HTTP.get(search_url, headers=headers)
-        if response.status != 200
-            error("Failed to fetch PRs: $(response.body)")
-        end
-        data = JSON.parse(String(response.body))
-        append!(prs, data["items"])
+        try
+            response = HTTP.get(search_url, headers=headers, connect_timeout=30, read_timeout=60)
+            if response.status != 200
+                error("Failed to fetch PRs (HTTP $(response.status)): $(String(response.body))")
+            end
+            data = JSON.parse(String(response.body))
+            
+            # Handle API rate limiting
+            if haskey(data, "message") && occursin("rate limit", lowercase(data["message"]))
+                @warn "GitHub API rate limit exceeded. Waiting 60 seconds..."
+                sleep(60)
+                continue
+            end
+            
+            append!(prs, data["items"])
 
-        # Check if there are more pages
-        if !haskey(data, "items") || isempty(data["items"])
-            break
+            # Check if there are more pages
+            if !haskey(data, "items") || isempty(data["items"])
+                break
+            end
+            page += 1
+        catch e
+            error("Failed to fetch PRs from GitHub: $e")
         end
-        page += 1
     end
 
     # Filter and map to your desired structure if necessary
-    # This is slow...
-    return map(pr -> GitHub.pull_request(REPO, pr["number"]; auth=getauth()), prs)
+    println("Fetching detailed PR information for $(length(prs)) PRs...")
+    
+    # Use caching to avoid refetching the same PRs
+    detailed_prs = []
+    for pr_item in prs
+        pr_number = pr_item["number"]
+        if haskey(CACHE.pr_cache, pr_number)
+            push!(detailed_prs, CACHE.pr_cache[pr_number])
+        else
+            detailed_pr = GitHub.pull_request(config.repo, pr_number; auth=authenticate!(GITHUB_AUTH, config))
+            CACHE.pr_cache[pr_number] = detailed_pr
+            push!(detailed_prs, detailed_pr)
+        end
+    end
+    
+    return detailed_prs
 end
 
-function do_backporting(refresh_prs = false)
-    label_prs = collect_label_prs(BACKPORT_LABEL)
-    _do_backporting(label_prs)
+function do_backporting(config::BackportConfig)
+    label_prs = collect_label_prs(config)
+    _do_backporting(label_prs, config)
 end
 
-function _do_backporting(prs)
+function _do_backporting(prs, config::BackportConfig)
     # Get from release branch
-    already_backported_commits = cherry_picked_commits(BACKPORT)
+    already_backported_commits = cherry_picked_commits(config.backport_version)
     open_prs = []
     closed_prs = []
     already_backported = []
@@ -175,13 +279,18 @@ function _do_backporting(prs)
         if pr.commits === nothing
             # When does this happen...
             i = findfirst(x -> x.number == pr.number, prs)
-            pr = GitHub.pull_request(REPO, pr.number; auth=getauth())
+            if haskey(CACHE.pr_cache, pr.number)
+                pr = CACHE.pr_cache[pr.number]
+            else
+                pr = GitHub.pull_request(config.repo, pr.number; auth=authenticate!(GITHUB_AUTH, config))
+                CACHE.pr_cache[pr.number] = pr
+            end
             @assert pr.commits !== nothing
             prs[i] = pr
         end
         if pr.commits != 1
             # Check if this was squashed, in that case we can still backport
-            if was_squashed_pr(pr) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
+            if was_squashed_pr(pr, config) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
                 push!(successful_backports, pr)
             else
                 push!(multi_commit_prs, pr)
@@ -205,7 +314,8 @@ function _do_backporting(prs)
         println()
     end
 
-    if !isempty(open_prs) println("The following PRs are open but have a backport label, merge first?")
+    if !isempty(open_prs)
+        println("The following PRs are open but have a backport label, merge first?")
         for pr in open_prs
             println("    #$(pr.number) - $(pr.html_url)")
         end
@@ -278,5 +388,49 @@ function _do_backporting(prs)
     end
 end
 
-prs = collect_label_prs(BACKPORT_LABEL)
-_do_backporting(prs)
+function main()
+    println("Julia Backporter Tool")
+    println("====================")
+    
+    # Validate environment
+    if !isdir(".git")
+        error("This script must be run from the root of a git repository")
+    end
+    
+    # Check if we're on the expected branch
+    current_branch = branch()
+    expected_branch_pattern = r"^backports?-release-"
+    if !occursin(expected_branch_pattern, current_branch)
+        @warn "Current branch '$current_branch' doesn't match expected backport branch pattern."
+        print("Continue anyway? (y/N): ")
+        response = readline()
+        if lowercase(strip(response)) != "y"
+            println("Exiting...")
+            return
+        end
+    end
+    
+    config = DEFAULT_CONFIG
+    println("\nConfiguration:")
+    println("  Target version: $(config.backport_version)")
+    println("  Repository: $(config.repo)")
+    println("  Label: $(config.backport_label)")
+    println("  Current branch: $current_branch")
+    println()
+    
+    try
+        start_time = time()
+        prs = collect_label_prs(config)
+        println("Collected $(length(prs)) PRs in $(round(time() - start_time, digits=1))s")
+        
+        _do_backporting(prs, config)
+        
+        total_time = time() - start_time
+        println("\nBackport process completed in $(round(total_time, digits=1))s")
+    catch e
+        error("Backporting failed: $e")
+    end
+end
+
+# Run main function
+main()
