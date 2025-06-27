@@ -5,7 +5,16 @@ Julia Backporter Tool
 A CLI tool for backporting Julia PRs to release branches.
 Automatically detects target version and repository from git context.
 
-Requires GITHUB_AUTH environment variable to be set.
+Requires GITHUB_TOKEN environment variable to be set.
+
+This script has been significantly refactored from its original ad-hoc form (with AI assistance):
+- Added proper CLI interface with argument parsing
+- Implemented smart defaults (auto-detect version from branch, repo from git remote)
+- Added configuration management and error handling
+- Parallel PR fetching for better performance
+- Safety checks (branch validation, clean working directory)
+- Automatic fetch/rebase before starting backports
+- Proper project environment activation with symlink resolution
 """
 
 # Activate the project environment in the script's directory (resolve symlinks)
@@ -31,9 +40,9 @@ struct BackportConfig
     github_auth::String
 end
 function BackportConfig(backport_version::AbstractString, repo::AbstractString="JuliaLang/julia")
-    github_auth = get(ENV, "GITHUB_AUTH", "")
+    github_auth = get(ENV, "GITHUB_TOKEN", "")
     if isempty(github_auth)
-        error("GITHUB_AUTH environment variable must be set")
+        error("GITHUB_TOKEN environment variable must be set")
     end
     backport_label = "backport $backport_version"
     BackportConfig(backport_version, repo, backport_label, github_auth)
@@ -48,32 +57,38 @@ struct CLIOptions
     repo::Union{String, Nothing}
     help::Bool
     dry_run::Bool
+    validate_branch::Bool
+    require_clean::Bool
 end
 
 function parse_cli_args(args::Vector{String})
-    options = CLIOptions(nothing, nothing, false, false)
+    options = CLIOptions(nothing, nothing, false, false, true, true)
     
     i = 1
     while i <= length(args)
         arg = args[i]
         if arg == "--help" || arg == "-h"
-            options = CLIOptions(options.version, options.repo, true, options.dry_run)
+            options = CLIOptions(options.version, options.repo, true, options.dry_run, options.validate_branch, options.require_clean)
         elseif arg == "--version" || arg == "-v"
             if i + 1 <= length(args)
-                options = CLIOptions(args[i+1], options.repo, options.help, options.dry_run)
+                options = CLIOptions(args[i+1], options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean)
                 i += 1
             else
                 error("--version requires a value")
             end
         elseif arg == "--repo" || arg == "-r"
             if i + 1 <= length(args)
-                options = CLIOptions(options.version, args[i+1], options.help, options.dry_run)
+                options = CLIOptions(options.version, args[i+1], options.help, options.dry_run, options.validate_branch, options.require_clean)
                 i += 1
             else
                 error("--repo requires a value")
             end
         elseif arg == "--dry-run" || arg == "-n"
-            options = CLIOptions(options.version, options.repo, options.help, true)
+            options = CLIOptions(options.version, options.repo, options.help, true, options.validate_branch, options.require_clean)
+        elseif arg == "--no-validate-branch"
+            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, false, options.require_clean)
+        elseif arg == "--no-require-clean"
+            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, false)
         else
             error("Unknown argument: $arg")
         end
@@ -94,13 +109,19 @@ function show_help()
     println("  -v, --version VERSION    Backport version (e.g., 1.11, 1.12)")
     println("  -r, --repo REPO         Repository in format owner/name")
     println("  -n, --dry-run           Show what would be done without making changes")
+    println("  --no-validate-branch    Skip branch name validation")
+    println("  --no-require-clean      Allow dirty working directory")
     println("  -h, --help              Show this help message")
     println()
     println("DEFAULTS:")
     println("  Version is auto-detected from current branch name")
     println("  Repository is auto-detected from git remote origin")
     println()
+    println("ENVIRONMENT:")
+    println("  GITHUB_TOKEN                 GitHub personal access token (required)")
+    println()
     println("EXAMPLES:")
+    println("  export GITHUB_TOKEN=ghp_xxxxxxxxxxxx")
     println("  julia backporter.jl                    # Use auto-detected settings")
     println("  julia backporter.jl -v 1.11            # Backport to version 1.11")
     println("  julia backporter.jl -r myorg/julia     # Use custom repository")
@@ -152,12 +173,62 @@ function get_real_hash(hash::AbstractString)
     return hash
 end
 
-function try_cherry_pick(hash::AbstractString)
-    # Ensure we have a clean working directory
-    if !success(`git diff --quiet`)
-        error("Working directory is not clean. Please commit or stash changes before cherry-picking.")
+function is_working_directory_clean()
+    return success(`git diff --quiet`) && success(`git diff --cached --quiet`)
+end
+
+function validate_git_state(options::CLIOptions)
+    # Check if we're on the expected branch
+    if options.validate_branch
+        current_branch = branch()
+        expected_branch_pattern = r"^backports?-release-"
+        if !occursin(expected_branch_pattern, current_branch)
+            if options.dry_run
+                @warn "Current branch '$current_branch' doesn't match expected backport branch pattern."
+            else
+                @warn "Current branch '$current_branch' doesn't match expected backport branch pattern."
+                print("Continue anyway? (y/N): ")
+                response = readline()
+                if lowercase(strip(response)) != "y"
+                    error("Exiting due to unexpected branch name.")
+                end
+            end
+        end
     end
     
+    # Check if working directory is clean
+    if options.require_clean && !is_working_directory_clean()
+        error("Working directory is not clean. Please commit or stash changes before running backporter.")
+    end
+end
+
+function fetch_and_rebase(config::BackportConfig, options::CLIOptions)
+    current_branch = branch()
+    
+    println("Fetching latest changes from origin...")
+    if !success(`git fetch origin`)
+        error("Failed to fetch from origin")
+    end
+    
+    # Rebase onto the remote version of the current branch
+    println("Rebasing $current_branch onto origin/$current_branch...")
+    if !options.dry_run
+        if !success(`git rebase origin/$current_branch`)
+            # Try to abort the rebase
+            try
+                read(`git rebase --abort`)
+            catch
+                # Ignore abort errors
+            end
+            error("Failed to rebase $current_branch onto origin/$current_branch. Please resolve conflicts manually.")
+        end
+        println("Successfully rebased onto origin/$current_branch")
+    else
+        println("[DRY RUN] Would rebase $current_branch onto origin/$current_branch")
+    end
+end
+
+function try_cherry_pick(hash::AbstractString)
     if !success(`git cherry-pick -x $hash`)
         try
             read(`git cherry-pick --abort`)
@@ -253,13 +324,6 @@ end
 # Data Structures
 # ============================================================================
 
-# Cache for performance improvements
-struct BackportCache
-    sha_to_pr::Dict{String, Int}
-    pr_cache::Dict{Int, Any}  # Cache PR objects to avoid refetching
-end
-BackportCache() = BackportCache(Dict{String, Int}(), Dict{Int, Any}())
-
 # GitHub authentication
 struct GitHubAuthenticator
     auth::Ref{GitHub.Authorization}
@@ -271,16 +335,13 @@ function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfi
         try
             authenticator.auth[] = GitHub.authenticate(config.github_auth)
         catch e
-            error("Failed to authenticate with GitHub: $e. Please check your GITHUB_AUTH token.")
+            error("Failed to authenticate with GitHub: $e. Please check your GITHUB_TOKEN.")
         end
     end
     return authenticator.auth[]
 end
 
-function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
-    if haskey(cache.sha_to_pr, hash)
-        return cache.sha_to_pr[hash]
-    end
+function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig, auth::GitHubAuthenticator)
     
     try
         headers = Dict()
@@ -305,7 +366,6 @@ function find_pr_associated_with_commit(hash::AbstractString, config::BackportCo
         end
 
         pr = parse(Int, basename(item["pull_request"]["url"]))
-        cache.sha_to_pr[hash] = pr
         return pr
     catch e
         @warn "Failed to find PR for commit $hash: $e"
@@ -313,12 +373,12 @@ function find_pr_associated_with_commit(hash::AbstractString, config::BackportCo
     end
 end
 
-function was_squashed_pr(pr, config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
+function was_squashed_pr(pr, config::BackportConfig, auth::GitHubAuthenticator)
     parents = get_parents(pr.merge_commit_sha)
     if length(parents) != 1
         return false
     end
-    return pr.number != find_pr_associated_with_commit(parents[1], config, cache, auth)
+    return pr.number != find_pr_associated_with_commit(parents[1], config, auth)
 end
 
 
@@ -326,7 +386,7 @@ end
 # GitHub API Functions
 # ============================================================================
 
-function collect_label_prs(config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
+function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
     prs = []
     page = 1
     backport_label_encoded = replace(config.backport_label, " " => "+")
@@ -365,28 +425,15 @@ function collect_label_prs(config::BackportConfig, cache::BackportCache, auth::G
     # Filter and map to your desired structure if necessary
     println("Fetching detailed PR information for $(length(prs)) PRs...")
     
-    # Fetch detailed PR information with caching and parallelization
-    detailed_prs = Vector{Any}(undef, length(prs))
-    uncached_indices = Int[]
-    uncached_numbers = Int[]
+    # Fetch detailed PR information in parallel
+    pr_numbers = [pr_item["number"] for pr_item in prs]
     
-    # First pass: collect cached PRs and identify uncached ones
-    for (i, pr_item) in enumerate(prs)
-        pr_number = pr_item["number"]
-        if haskey(cache.pr_cache, pr_number)
-            detailed_prs[i] = cache.pr_cache[pr_number]
-        else
-            push!(uncached_indices, i)
-            push!(uncached_numbers, pr_number)
-        end
-    end
-    
-    if !isempty(uncached_numbers)
-        println("Fetching $(length(uncached_numbers)) uncached PRs in parallel...")
+    if !isempty(pr_numbers)
+        println("Fetching $(length(pr_numbers)) PRs in parallel...")
         
-        # Fetch uncached PRs in parallel using asyncmap
+        # Fetch PRs in parallel using asyncmap
         auth_ref = authenticate!(auth, config)
-        @time fetched_prs = asyncmap(uncached_numbers; ntasks=min(20, length(uncached_numbers))) do pr_number
+        detailed_prs = asyncmap(pr_numbers; ntasks=min(20, length(pr_numbers))) do pr_number
             try
                 GitHub.pull_request(config.repo, pr_number; auth=auth_ref)
             catch e
@@ -395,26 +442,19 @@ function collect_label_prs(config::BackportConfig, cache::BackportCache, auth::G
             end
         end
         
-        # Store results in cache and detailed_prs array
-        for (idx, pr) in zip(uncached_indices, fetched_prs)
-            if pr !== nothing
-                pr_number = uncached_numbers[idx - uncached_indices[1] + 1]
-                cache.pr_cache[pr_number] = pr
-                detailed_prs[idx] = pr
-            end
-        end
+        # Filter out any failed fetches
+        return filter(pr -> pr !== nothing, detailed_prs)
+    else
+        return []
     end
-    
-    # Filter out any failed fetches
-    return filter(pr -> pr !== nothing, detailed_prs)
 end
 
-function do_backporting(config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
-    label_prs = collect_label_prs(config, cache, auth)
-    _do_backporting(label_prs, config, cache, auth)
+function do_backporting(config::BackportConfig, auth::GitHubAuthenticator)
+    label_prs = collect_label_prs(config, auth)
+    _do_backporting(label_prs, config, auth)
 end
 
-function _do_backporting_analysis(prs, config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
+function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthenticator)
     # Analyze PRs without making changes (for dry-run mode)
     # Get from release branch
     already_backported_commits = cherry_picked_commits(config.backport_version)
@@ -452,7 +492,7 @@ function _do_backporting_analysis(prs, config::BackportConfig, cache::BackportCa
     end
 end
 
-function _do_backporting(prs, config::BackportConfig, cache::BackportCache, auth::GitHubAuthenticator)
+function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
     # Get from release branch
     already_backported_commits = cherry_picked_commits(config.backport_version)
     open_prs = []
@@ -482,20 +522,15 @@ function _do_backporting(prs, config::BackportConfig, cache::BackportCache, auth
     multi_commit_prs = []
     for pr in backport_candidates
         if pr.commits === nothing
-            # Handle case where commits field is missing
+            # Handle case where commits field is missing - refetch PR
             i = findfirst(x -> x.number == pr.number, prs)
-            if haskey(cache.pr_cache, pr.number)
-                pr = cache.pr_cache[pr.number]
-            else
-                pr = GitHub.pull_request(config.repo, pr.number; auth=authenticate!(auth, config))
-                cache.pr_cache[pr.number] = pr
-            end
+            pr = GitHub.pull_request(config.repo, pr.number; auth=authenticate!(auth, config))
             @assert pr.commits !== nothing
             prs[i] = pr
         end
         if pr.commits != 1
             # Check if this was squashed - we can still backport squashed PRs
-            if was_squashed_pr(pr, config, cache, auth) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
+            if was_squashed_pr(pr, config, auth) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
                 push!(successful_backports, pr)
             else
                 push!(multi_commit_prs, pr)
@@ -610,23 +645,16 @@ function main(args)
         error("This script must be run from the root of a git repository")
     end
     
+    # Validate git state (branch name, clean working directory)
+    validate_git_state(options)
+    
     # Create configuration from CLI options and smart defaults
     config = create_config_from_options(options)
     
-    # Check if we're on the expected branch
+    # Fetch and rebase before starting
+    fetch_and_rebase(config, options)
+    
     current_branch = branch()
-    expected_branch_pattern = r"^backports?-release-"
-    if !occursin(expected_branch_pattern, current_branch)
-        @warn "Current branch '$current_branch' doesn't match expected backport branch pattern."
-        if !options.dry_run
-            print("Continue anyway? (y/N): ")
-            response = readline()
-            if lowercase(strip(response)) != "y"
-                println("Exiting...")
-                return
-            end
-        end
-    end
     
     println("Configuration:")
     println("  Target version: $(config.backport_version)")
@@ -636,21 +664,26 @@ function main(args)
     if options.dry_run
         println("  Mode: DRY RUN (no changes will be made)")
     end
+    if !options.validate_branch
+        println("  Branch validation: DISABLED")
+    end
+    if !options.require_clean
+        println("  Clean directory check: DISABLED")
+    end
     println()
     
     try
-        cache = BackportCache()
         auth = GitHubAuthenticator()
         start_time = time()
-        prs = collect_label_prs(config, cache, auth)
+        prs = collect_label_prs(config, auth)
         println("Collected $(length(prs)) PRs in $(round(time() - start_time, digits=1))s")
         
         if options.dry_run
             println("\n[DRY RUN] Would perform backporting operations for $(length(prs)) PRs")
             # Still show the analysis but don't actually cherry-pick
-            _do_backporting_analysis(prs, config, cache, auth)
+            _do_backporting_analysis(prs, config, auth)
         else
-            _do_backporting(prs, config, cache, auth)
+            _do_backporting(prs, config, auth)
         end
         
         total_time = time() - start_time
