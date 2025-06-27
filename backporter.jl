@@ -560,9 +560,9 @@ function _do_backporting(prs, config::BackportConfig, cache::BackportCache, auth
     end
 end
 
-function main()
+function (@main)(args)
     # Parse command line arguments
-    options = parse_cli_args(ARGS)
+    options = parse_cli_args(args)
     
     if options.help
         show_help()
@@ -626,6 +626,3 @@ function main()
         error("Backporting failed: $e")
     end
 end
-
-# Run main function
-main()
