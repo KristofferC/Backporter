@@ -59,36 +59,44 @@ struct CLIOptions
     dry_run::Bool
     validate_branch::Bool
     require_clean::Bool
+    test_commit::Union{String, Nothing}
 end
 
 function parse_cli_args(args::Vector{String})
-    options = CLIOptions(nothing, nothing, false, false, true, true)
+    options = CLIOptions(nothing, nothing, false, false, true, true, nothing)
     
     i = 1
     while i <= length(args)
         arg = args[i]
         if arg == "--help" || arg == "-h"
-            options = CLIOptions(options.version, options.repo, true, options.dry_run, options.validate_branch, options.require_clean)
+            options = CLIOptions(options.version, options.repo, true, options.dry_run, options.validate_branch, options.require_clean, options.test_commit)
         elseif arg == "--version" || arg == "-v"
             if i + 1 <= length(args)
-                options = CLIOptions(args[i+1], options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean)
+                options = CLIOptions(args[i+1], options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean, options.test_commit)
                 i += 1
             else
                 error("--version requires a value")
             end
         elseif arg == "--repo" || arg == "-r"
             if i + 1 <= length(args)
-                options = CLIOptions(options.version, args[i+1], options.help, options.dry_run, options.validate_branch, options.require_clean)
+                options = CLIOptions(options.version, args[i+1], options.help, options.dry_run, options.validate_branch, options.require_clean, options.test_commit)
                 i += 1
             else
                 error("--repo requires a value")
             end
+        elseif arg == "--test-commit" || arg == "-t"
+            if i + 1 <= length(args)
+                options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean, args[i+1])
+                i += 1
+            else
+                error("--test-commit requires a commit hash")
+            end
         elseif arg == "--dry-run" || arg == "-n"
-            options = CLIOptions(options.version, options.repo, options.help, true, options.validate_branch, options.require_clean)
+            options = CLIOptions(options.version, options.repo, options.help, true, options.validate_branch, options.require_clean, options.test_commit)
         elseif arg == "--no-validate-branch"
-            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, false, options.require_clean)
+            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, false, options.require_clean, options.test_commit)
         elseif arg == "--no-require-clean"
-            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, false)
+            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, false, options.test_commit)
         else
             error("Unknown argument: $arg")
         end
@@ -108,6 +116,7 @@ function show_help()
     println("OPTIONS:")
     println("  -v, --version VERSION    Backport version (e.g., 1.11, 1.12)")
     println("  -r, --repo REPO         Repository in format owner/name")
+    println("  -t, --test-commit HASH  Test backport of a single commit")
     println("  -n, --dry-run           Show what would be done without making changes")
     println("  --no-validate-branch    Skip branch name validation")
     println("  --no-require-clean      Allow dirty working directory")
@@ -126,6 +135,7 @@ function show_help()
     println("  julia backporter.jl -v 1.11            # Backport to version 1.11")
     println("  julia backporter.jl -r myorg/julia     # Use custom repository")
     println("  julia backporter.jl --dry-run          # Preview changes only")
+    println("  julia backporter.jl -t 89dfb68         # Test single commit backport")
 end
 
 # ============================================================================
@@ -230,7 +240,25 @@ end
 
 function try_cherry_pick(hash::AbstractString)
     if !success(`git cherry-pick -x $hash`)
+        # Check if the cherry-pick failed due to an empty commit (already backported)
         try
+            status_output = read(`git status --porcelain`, String)
+            if isempty(strip(status_output))
+                # Working tree is clean, check if we're in a cherry-pick state with empty commit
+                try
+                    cherry_pick_head = read(`git rev-parse --verify CHERRY_PICK_HEAD`, String)
+                    if !isempty(strip(cherry_pick_head))
+                        # We're in cherry-pick state with empty commit - skip it and treat as success
+                        read(`git cherry-pick --skip`)
+                        println("  Skipped empty commit $hash (already backported)")
+                        return true
+                    end
+                catch
+                    # Not in cherry-pick state, proceed with abort
+                end
+            end
+            
+            # Regular failure case - abort the cherry-pick
             read(`git cherry-pick --abort`)
         catch e
             @warn "Failed to abort cherry-pick: $e"
@@ -492,6 +520,21 @@ function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthe
     end
 end
 
+function test_single_commit(commit_hash::String, options::CLIOptions)
+    println("Testing backport of single commit: $commit_hash")
+    
+    if options.dry_run
+        println("[DRY RUN] Would attempt to cherry-pick commit $commit_hash")
+        return
+    end
+    
+    if try_cherry_pick(commit_hash)
+        println("✓ Successfully backported commit $commit_hash")
+    else
+        println("✗ Failed to backport commit $commit_hash")
+    end
+end
+
 function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
     # Get from release branch
     already_backported_commits = cherry_picked_commits(config.backport_version)
@@ -671,6 +714,13 @@ function main(args)
         println("  Clean directory check: DISABLED")
     end
     println()
+    
+    # Check if we're in single commit test mode
+    if options.test_commit !== nothing
+        println("Single commit test mode")
+        test_single_commit(options.test_commit, options)
+        return
+    end
     
     try
         auth = GitHubAuthenticator()
