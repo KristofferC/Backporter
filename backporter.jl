@@ -254,7 +254,26 @@ function try_cherry_pick(hash::AbstractString)
                         return true
                     end
                 catch
-                    # Not in cherry-pick state, proceed with abort
+                    # Not in cherry-pick state, proceed with merge commit check
+                end
+            end
+            
+            # Check if this is a merge commit and try with -m 1
+            parents = get_parents(hash)
+            if length(parents) > 1
+                println("  Detected merge commit $hash, retrying with -m 1...")
+                read(`git cherry-pick --abort`)  # Clean up first
+                if success(`git cherry-pick -x $hash -m 1`)
+                    println("  Successfully cherry-picked merge commit $hash with -m 1")
+                    return true
+                else
+                    # Still failed even with -m 1, abort and return false
+                    try
+                        read(`git cherry-pick --abort`)
+                    catch e
+                        @warn "Failed to abort cherry-pick after -m 1 attempt: $e"
+                    end
+                    return false
                 end
             end
             
