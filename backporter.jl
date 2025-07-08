@@ -134,7 +134,7 @@ end
 function cherry_picked_commits(version)
     commits = Set{String}()
     
-    base = "release-$version"
+    base = "origin/release-$version"
     against = "backports-release-$version"
     
     # Check if branches exist
