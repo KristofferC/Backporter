@@ -610,6 +610,8 @@ function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
     if !isempty(remove_label_prs)
         sort!(remove_label_prs; by = x -> (x.merged_at == nothing ? now() : x.merged_at))
         println("The following PRs are closed or already backported but still has a backport label, remove the label:")
+        # https://github.com/KristofferC/Backporter/issues/11
+        println("(don't remove the label until you have merged the backports PR)")
         for pr in remove_label_prs
             println("    #$(pr.number) - $(pr.html_url)")
         end
