@@ -1,4 +1,4 @@
-#!/usr/bin/env -S julia  
+#!/usr/bin/env -S julia
 """
 Julia Backporter Tool
 
@@ -26,8 +26,9 @@ import GitHub
 import Dates
 import JSON
 import HTTP
+using TimeZones: TimeZones, ZonedDateTime, @tz_str
 import URIs
-using Dates: now
+using Dates: Dates, now
 
 # ============================================================================
 # Configuration
@@ -64,7 +65,7 @@ end
 
 function parse_cli_args(args::Vector{String})
     options = CLIOptions(nothing, nothing, false, false, true, true, nothing)
-    
+
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -102,7 +103,7 @@ function parse_cli_args(args::Vector{String})
         end
         i += 1
     end
-    
+
     return options
 end
 
@@ -143,10 +144,10 @@ end
 # ============================================================================
 function cherry_picked_commits(version)
     commits = Set{String}()
-    
+
     base = "origin/release-$version"
     against = "backports-release-$version"
-    
+
     # Check if branches exist
     if !success(`git rev-parse --verify $base`)
         error("Base branch '$base' does not exist")
@@ -154,7 +155,7 @@ function cherry_picked_commits(version)
     if !success(`git rev-parse --verify $against`)
         error("Target branch '$against' does not exist")
     end
-    
+
     try
         logg = read(`git log $base...$against`, String)
         for match in eachmatch(r"\(cherry picked from commit (.*?)\)", logg)
@@ -205,7 +206,7 @@ function validate_git_state(options::CLIOptions)
             end
         end
     end
-    
+
     # Check if working directory is clean
     if options.require_clean && !is_working_directory_clean()
         error("Working directory is not clean. Please commit or stash changes before running backporter.")
@@ -214,12 +215,12 @@ end
 
 function fetch_and_rebase(config::BackportConfig, options::CLIOptions)
     current_branch = branch()
-    
+
     println("Fetching latest changes from origin...")
     if !success(`git fetch origin`)
         error("Failed to fetch from origin")
     end
-    
+
     # Rebase onto the remote version of the current branch
     println("Rebasing $current_branch onto origin/$current_branch...")
     if !options.dry_run
@@ -257,7 +258,7 @@ function try_cherry_pick(hash::AbstractString)
                     # Not in cherry-pick state, proceed with merge commit check
                 end
             end
-            
+
             # Check if this is a merge commit and try with -m 1
             parents = get_parents(hash)
             if length(parents) > 1
@@ -276,7 +277,7 @@ function try_cherry_pick(hash::AbstractString)
                     return false
                 end
             end
-            
+
             # Regular failure case - abort the cherry-pick
             read(`git cherry-pick --abort`)
         catch e
@@ -298,19 +299,19 @@ end
 function detect_version_from_branch()
     # Detect backport version from current branch name
     current_branch = branch()
-    
+
     # Match patterns like: backports-release-1.11, backport-release-1.12, etc.
     m = match(r"backports?-release-([0-9]+\.[0-9]+)", current_branch)
     if m !== nothing
         return m.captures[1]
     end
-    
+
     # Match patterns like: release-1.11, release-1.12
     m = match(r"release-([0-9]+\.[0-9]+)", current_branch)
     if m !== nothing
         return m.captures[1]
     end
-    
+
     return nothing
 end
 
@@ -318,19 +319,19 @@ function detect_repo_from_remote()
     # Detect repository from git remote origin
     try
         remote_url = chomp(String(read(`git remote get-url origin`)))
-        
+
         # Handle GitHub SSH URLs: git@github.com:owner/repo.git
         m = match(r"git@github\.com:([^/]+/[^/]+)\.git", remote_url)
         if m !== nothing
             return m.captures[1]
         end
-        
+
         # Handle GitHub HTTPS URLs: https://github.com/owner/repo.git
         m = match(r"https://github\.com/([^/]+/[^/]+)(?:\.git)?", remote_url)
         if m !== nothing
             return m.captures[1]
         end
-        
+
         @warn "Could not parse repository from remote URL: $remote_url"
         return nothing
     catch e
@@ -341,7 +342,7 @@ end
 
 function create_config_from_options(options::CLIOptions)
     # Create BackportConfig from CLI options with smart defaults
-    
+
     # Determine version
     version = options.version
     if version === nothing
@@ -351,7 +352,7 @@ function create_config_from_options(options::CLIOptions)
         end
         println("Auto-detected version: $version")
     end
-    
+
     # Determine repository
     repo = options.repo
     if repo === nothing
@@ -363,7 +364,7 @@ function create_config_from_options(options::CLIOptions)
             println("Auto-detected repository: $repo")
         end
     end
-    
+
     return BackportConfig(version, repo)
 end
 
@@ -388,22 +389,74 @@ function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfi
     return authenticator.auth[]
 end
 
+function sleep_until_unixtime_utc(unixtime_utc::Integer)
+    destination = ZonedDateTime(Dates.unix2datetime(unixtime_utc), tz"UTC")
+    sleep_until(destination)
+end
+
+function sleep_until(destination::ZonedDateTime)
+    right_now = Dates.now(TimeZones.localzone())
+    time_remaining = max(destination - right_now, Dates.Second(0))
+    time_remaining_str = Dates.canonicalize(time_remaining)
+    @info "Sleeping for $time_remaining_str so that the GitHub search rate limit will reset"
+    sleep(time_remaining)
+    return nothing
+end
+
+function sleep_until_search_rate_limit_reset(; auth::GitHubAuthenticator)
+    info = GitHub.rate_limit(; auth = auth.auth[])
+    remaining = info["resources"]["search"]["reset"] # Unix timestamp, in UTC
+    sleep_until_unixtime_utc(remaining)
+ end
+
+function we_hit_search_rate_limit(; auth::GitHubAuthenticator)
+    info = GitHub.rate_limit(; auth = auth.auth[])
+    remaining = info["resources"]["search"]["remaining"]
+    did_hit_limit = remaining == 0
+    return did_hit_limit
+end
+
+function _trycatch_github_search(url::String; headers::AbstractDict, auth::GitHubAuthenticator)
+    (; finished, resp) = try
+        resp = HTTP.request("GET", url; headers, connect_timeout=30, read_timeout=60)
+        (; finished=true, resp)
+    catch
+        if !we_hit_search_rate_limit(; auth)
+            rethrow()
+        end
+        sleep_until_search_rate_limit_reset(; auth)
+        (; finished=false, resp=nothing)
+    end
+    return (; finished, resp)
+end
+
+function github_search(url::String; headers::AbstractDict, auth::GitHubAuthenticator)
+    # Instead of a `while true`, we do a for loop
+    # To prevent us from getting stuck forever
+    for i = 1:100
+        (; finished, resp) = _trycatch_github_search(url; headers, auth)
+        if finished
+            return resp
+        end
+    end
+    error("This error should never happen")
+end
+
 function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig, auth::GitHubAuthenticator)
-    
     try
         headers = Dict()
         GitHub.authenticate_headers!(headers, authenticate!(auth, config))
         headers["User-Agent"] = "GitHub-jl"
-        
-        req = HTTP.request("GET", "https://api.github.com/search/issues?q=$hash+type:pr+repo:$(config.repo)";
-                     headers = headers, connect_timeout=30, read_timeout=60)
-        
-        if req.status != 200
-            @warn "GitHub API request failed with status $(req.status)"
+
+        url = "https://api.github.com/search/issues?q=$hash+type:pr+repo:$(config.repo)"
+        resp = github_search(url; headers, auth)
+
+        if resp.status != 200
+            @warn "GitHub API request failed with status $(resp.status)"
             return nothing
         end
-        
-        json = JSON.parse(String(req.body))
+
+        json = JSON.parse(String(resp.body))
         if json["total_count"] !== 1
             return nothing
         end
@@ -414,8 +467,10 @@ function find_pr_associated_with_commit(hash::AbstractString, config::BackportCo
 
         pr = parse(Int, basename(item["pull_request"]["url"]))
         return pr
-    catch e
-        @warn "Failed to find PR for commit $hash: $e"
+    catch ex
+        bt = catch_backtrace()
+        @warn "Failed to find PR for commit $hash: $ex" exception=(ex, bt)
+        rethrow()
         return nothing
     end
 end
@@ -437,26 +492,20 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
     prs = []
     page = 1
     backport_label_encoded = replace(config.backport_label, " " => "+")
-    
+
     while true
         query = "repo:$(config.repo)+is:pr+label:%22$backport_label_encoded%22"
         search_url = "https://api.github.com/search/issues?q=$query&per_page=100&page=$page"
         headers = Dict("Authorization" => "token $(config.github_auth)")
 
         try
-            response = HTTP.get(search_url, headers=headers, connect_timeout=30, read_timeout=60)
+            response = github_search(search_url; headers, auth)
+
             if response.status != 200
                 error("Failed to fetch PRs (HTTP $(response.status)): $(String(response.body))")
             end
             data = JSON.parse(String(response.body))
-            
-            # Handle API rate limiting
-            if haskey(data, "message") && occursin("rate limit", lowercase(data["message"]))
-                @warn "GitHub API rate limit exceeded. Waiting 60 seconds..."
-                sleep(60)
-                continue
-            end
-            
+
             append!(prs, data["items"])
 
             # Check if there are more pages
@@ -464,31 +513,36 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
                 break
             end
             page += 1
-        catch e
-            error("Failed to fetch PRs from GitHub: $e")
+        catch ex
+            bt = catch_backtrace()
+            msg = "Failed to fetch PRs from GitHub: $ex"
+            @warn msg exception=(ex, bt)
+            error(msg)
         end
     end
 
     # Filter and map to your desired structure if necessary
     println("Fetching detailed PR information for $(length(prs)) PRs...")
-    
+
     # Fetch detailed PR information in parallel
     pr_numbers = [pr_item["number"] for pr_item in prs]
-    
+
     if !isempty(pr_numbers)
         println("Fetching $(length(pr_numbers)) PRs in parallel...")
-        
+
         # Fetch PRs in parallel using asyncmap
         auth_ref = authenticate!(auth, config)
         detailed_prs = asyncmap(pr_numbers; ntasks=min(20, length(pr_numbers))) do pr_number
             try
                 GitHub.pull_request(config.repo, pr_number; auth=auth_ref)
-            catch e
-                @warn "Failed to fetch PR #$pr_number: $e"
+            catch ex
+                bt = catch_backtrace()
+                @warn "Failed to fetch PR #$pr_number: $ex" exception=(ex, bt)
+                rethrow()
                 nothing
             end
         end
-        
+
         # Filter out any failed fetches
         return filter(pr -> pr !== nothing, detailed_prs)
     else
@@ -509,7 +563,7 @@ function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthe
     closed_prs = []
     already_backported = []
     backport_candidates = []
-    
+
     for pr in prs
         if pr.state != "closed"
             push!(open_prs, pr)
@@ -523,13 +577,13 @@ function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthe
             end
         end
     end
-    
+
     println("Analysis Results:")
     println("  Open PRs: $(length(open_prs))")
     println("  Closed/unmerged PRs: $(length(closed_prs))")
     println("  Already backported: $(length(already_backported))")
     println("  Backport candidates: $(length(backport_candidates))")
-    
+
     # Show what would be done without actually doing it
     if !isempty(backport_candidates)
         println("\n[DRY RUN] Would attempt to backport:")
@@ -541,12 +595,12 @@ end
 
 function test_single_commit(commit_hash::String, options::CLIOptions)
     println("Testing backport of single commit: $commit_hash")
-    
+
     if options.dry_run
         println("[DRY RUN] Would attempt to cherry-pick commit $commit_hash")
         return
     end
-    
+
     if try_cherry_pick(commit_hash)
         println("✓ Successfully backported commit $commit_hash")
     else
@@ -695,31 +749,31 @@ end
 function main(args)
     # Parse command line arguments
     options = parse_cli_args(args)
-    
+
     if options.help
         show_help()
         return
     end
-    
+
     println("Julia Backporter Tool")
     println("======================\n")
-    
+
     # Validate environment
     if !ispath(".git")
         error("This script must be run from the root of a git repository")
     end
-    
+
     # Validate git state (branch name, clean working directory)
     validate_git_state(options)
-    
+
     # Create configuration from CLI options and smart defaults
     config = create_config_from_options(options)
-    
+
     # Fetch and rebase before starting
     fetch_and_rebase(config, options)
-    
+
     current_branch = branch()
-    
+
     println("Configuration:")
     println("  Target version: $(config.backport_version)")
     println("  Repository: $(config.repo)")
@@ -735,20 +789,20 @@ function main(args)
         println("  Clean directory check: DISABLED")
     end
     println()
-    
+
     # Check if we're in single commit test mode
     if options.test_commit !== nothing
         println("Single commit test mode")
         test_single_commit(options.test_commit, options)
         return
     end
-    
+
     try
         auth = GitHubAuthenticator()
         start_time = time()
         prs = collect_label_prs(config, auth)
         println("Collected $(length(prs)) PRs in $(round(time() - start_time, digits=1))s")
-        
+
         if options.dry_run
             println("\n[DRY RUN] Would perform backporting operations for $(length(prs)) PRs")
             # Still show the analysis but don't actually cherry-pick
@@ -756,11 +810,14 @@ function main(args)
         else
             _do_backporting(prs, config, auth)
         end
-        
+
         total_time = time() - start_time
         println("\nBackport process completed in $(round(total_time, digits=1))s")
-    catch e
-        error("Backporting failed: $e")
+    catch ex
+        bt = catch_backtrace()
+        msg = "Backporting failed: $ex"
+        @error msg exception=(ex, bt)
+        error(msg)
     end
 end
 
