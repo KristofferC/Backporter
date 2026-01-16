@@ -204,6 +204,15 @@ function get_real_hash(hash::AbstractString)
     return hash
 end
 
+# Check if a PR's merge commit has been cherry-picked to the backport branch.
+# We check both the transformed hash (get_real_hash extracts the second parent
+# for merge commits) and the original merge_commit_sha, since someone
+# cherry-picking manually may use merge_commit_sha directly. See issue #15.
+function is_pr_backported(pr, already_backported_commits::Set{String})
+    return get_real_hash(pr.merge_commit_sha) in already_backported_commits ||
+           pr.merge_commit_sha in already_backported_commits
+end
+
 function is_working_directory_clean()
     return success(`git diff --quiet`) && success(`git diff --cached --quiet`)
 end
@@ -553,7 +562,7 @@ function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthe
         else
             if pr.merged_at === nothing
                 push!(closed_prs, pr)
-            elseif get_real_hash(pr.merge_commit_sha) in already_backported_commits
+            elseif is_pr_backported(pr, already_backported_commits)
                 push!(already_backported, pr)
             else
                 push!(backport_candidates, pr)
@@ -604,7 +613,7 @@ function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
         else
             if pr.merged_at === nothing
                 push!(closed_prs, pr)
-            elseif get_real_hash(pr.merge_commit_sha) in already_backported_commits
+            elseif is_pr_backported(pr, already_backported_commits)
                 push!(already_backported, pr)
             else
                 push!(backport_candidates, pr)
