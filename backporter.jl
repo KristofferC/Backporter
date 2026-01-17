@@ -204,6 +204,15 @@ function get_real_hash(hash::AbstractString)
     return hash
 end
 
+# Check if a PR's merge commit has been cherry-picked to the backport branch.
+# We check both the transformed hash (get_real_hash extracts the second parent
+# for merge commits) and the original merge_commit_sha, since someone
+# cherry-picking manually may use merge_commit_sha directly. See issue #15.
+function is_pr_backported(pr, already_backported_commits::Set{String})
+    return get_real_hash(pr.merge_commit_sha) in already_backported_commits ||
+           pr.merge_commit_sha in already_backported_commits
+end
+
 function is_working_directory_clean()
     return success(`git diff --quiet`) && success(`git diff --cached --quiet`)
 end
@@ -538,9 +547,8 @@ function do_backporting(config::BackportConfig, auth::GitHubAuthenticator)
     _do_backporting(label_prs, config, auth)
 end
 
-function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthenticator)
-    # Analyze PRs without making changes (for dry-run mode)
-    # Get from release branch
+# Categorize PRs into: open, closed (unmerged), already backported, and candidates for backporting
+function categorize_prs(prs, config::BackportConfig)
     already_backported_commits = cherry_picked_commits(config.backport_version)
     open_prs = []
     closed_prs = []
@@ -553,13 +561,20 @@ function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthe
         else
             if pr.merged_at === nothing
                 push!(closed_prs, pr)
-            elseif get_real_hash(pr.merge_commit_sha) in already_backported_commits
+            elseif is_pr_backported(pr, already_backported_commits)
                 push!(already_backported, pr)
             else
                 push!(backport_candidates, pr)
             end
         end
     end
+
+    return (; open_prs, closed_prs, already_backported, backport_candidates)
+end
+
+function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthenticator)
+    # Analyze PRs without making changes (for dry-run mode)
+    (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
 
     println("Analysis Results:")
     println("  Open PRs: $(length(open_prs))")
@@ -592,25 +607,7 @@ function test_single_commit(commit_hash::String, options::CLIOptions)
 end
 
 function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
-    # Get from release branch
-    already_backported_commits = cherry_picked_commits(config.backport_version)
-    open_prs = []
-    closed_prs = []
-    already_backported = []
-    backport_candidates = []
-    for pr in prs
-        if pr.state != "closed"
-            push!(open_prs, pr)
-        else
-            if pr.merged_at === nothing
-                push!(closed_prs, pr)
-            elseif get_real_hash(pr.merge_commit_sha) in already_backported_commits
-                push!(already_backported, pr)
-            else
-                push!(backport_candidates, pr)
-            end
-        end
-    end
+    (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
 
     sort!(closed_prs; by = x -> x.number)
     sort!(already_backported; by = x -> x.merged_at)
