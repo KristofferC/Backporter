@@ -38,7 +38,7 @@ in the middle of the message, but this is not a real trailer."""
             run(`git fetch origin`)
 
             # Test the function
-            commits = cherry_picked_commits("1.0")
+            commits = get_cherry_picked_commits("1.0").already_backported_commits
 
             # Should find exactly one commit (the real trailer)
             @test length(commits) == 1
@@ -59,7 +59,7 @@ in the middle of the message, but this is not a real trailer."""
             run(`git fetch origin`)
 
             # Test the function - should return empty set
-            commits = cherry_picked_commits("1.0")
+            commits = get_cherry_picked_commits("1.0").already_backported_commits
             @test isempty(commits)
         end
     end
@@ -90,7 +90,7 @@ in the middle of the message, but this is not a real trailer."""
             run(`git fetch origin`)
 
             # Test the function - should find both commits
-            commits = cherry_picked_commits("1.0")
+            commits = get_cherry_picked_commits("1.0").already_backported_commits
             @test length(commits) == 2
             @test hash1 in commits
             @test hash2 in commits
