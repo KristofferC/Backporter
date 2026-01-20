@@ -179,7 +179,7 @@ function cherry_picked_commits(version)
     try
         # Get list of commit hashes first
         hashes = readlines(`git log $base...$against --format=%H`)
-        
+
         # For each commit, get its full message and check for cherry-pick trailer
         for hash in hashes
             msg = read(`git log -1 --format=%B $hash`, String)
@@ -813,25 +813,25 @@ end
 function clone_repo_to_temp(config::LabelAuditConfig)
     temp_dir = mktempdir()
     repo_url = "https://github.com/$(config.repo).git"
-    
+
     println("Cloning $(config.repo) to temporary directory...")
     if !success(`git clone --filter=blob:none --no-checkout $repo_url $temp_dir`)
         rm(temp_dir; force=true, recursive=true)
         error("Failed to clone repository $(config.repo)")
     end
-    
+
     return temp_dir
 end
 
 function get_commits_from_branch(config::LabelAuditConfig)
     temp_dir = clone_repo_to_temp(config)
-    
+
     try
         println("Fetching $(config.release_branch)...")
         if !success(`git -C $temp_dir fetch origin $(config.release_branch)`)
             error("Failed to fetch $(config.release_branch)")
         end
-        
+
         return parse_git_log_for_commits(temp_dir, "origin/$(config.release_branch)")
     finally
         rm(temp_dir; force=true, recursive=true)
@@ -840,13 +840,13 @@ end
 
 function get_commits_from_pr(config::LabelAuditConfig, pr_number::Int)
     temp_dir = clone_repo_to_temp(config)
-    
+
     try
         println("Fetching PR #$pr_number...")
         if !success(`git -C $temp_dir fetch origin pull/$pr_number/head:pr-$pr_number`)
             error("Failed to fetch PR #$pr_number")
         end
-        
+
         return parse_git_log_for_commits(temp_dir, "pr-$pr_number"; backport_pr=pr_number)
     finally
         rm(temp_dir; force=true, recursive=true)
@@ -856,34 +856,34 @@ end
 function parse_git_log_for_commits(repo_dir::String, ref::String; backport_pr::Union{Int,Nothing}=nothing)
     commits = Dict{Int,CommitInfo}()
     current_backport_pr = backport_pr
-    
+
     println("Parsing git log from $ref...")
     log_output = read(`git -C $repo_dir log --format=%H%n%B%n---COMMIT_SEPARATOR--- $ref`, String)
-    
+
     for commit_block in split(log_output, "---COMMIT_SEPARATOR---")
         commit_block = strip(commit_block)
         isempty(commit_block) && continue
-        
+
         lines = split(commit_block, '\n')
         isempty(lines) && continue
-        
+
         sha = strip(lines[1])
         message = join(lines[2:end], '\n')
-        
+
         if backport_pr === nothing
             merge_pr = extract_merge_pr_from_message(message)
             if merge_pr !== nothing
                 current_backport_pr = merge_pr
             end
         end
-        
+
         for pr_num in extract_pr_numbers_from_message(message)
             if !haskey(commits, pr_num)
                 commits[pr_num] = CommitInfo(sha, current_backport_pr)
             end
         end
     end
-    
+
     return commits
 end
 
