@@ -177,7 +177,7 @@ function cherry_picked_commits(version)
     end
 
     try
-        logg = read(`git log $base...$against`, String)
+        logg = read(`git log $base...$against --pretty=%B`, String)
         for match in eachmatch(r"\(cherry picked from commit (.*?)\)", logg)
             push!(commits, match.captures[1])
         end
