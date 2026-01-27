@@ -195,12 +195,18 @@ function cherry_picked_commits(version)
     return commits
 end
 
-function get_parents(hash::AbstractString)
+function get_parents(hash::AbstractString; is_nested::Bool = false)
     try
         result = read(`git rev-list --parents -n 1 $hash`, String)
         return split(chomp(result))[2:end]
     catch e
-        error("Failed to get parents for commit $hash: $e")
+        if is_nested
+            error("Failed to get parents for commit $hash: $e")
+        end
+        # The commit might not exist locally, but it might exist on the remote
+        # So, let's try to fetch the commit from the remote
+        run(ignorestatus(`git fetch origin $hash`))
+        return get_parents(hash; is_nested = true)
     end
 end
 
