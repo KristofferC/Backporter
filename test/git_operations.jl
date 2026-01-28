@@ -92,9 +92,9 @@ copy!(ARGS, original_ARGS)
 
     @testset "branch detection" begin
         with_test_repo() do
-            # Test default branch (should be 'main' or 'master')
+            # Test default branch (should be 'main', because we initialize our test repo as such)
             current = branch()
-            @test current in ["main", "master"]
+            @test current == "main"
 
             # Create and checkout new branch
             run(`git checkout -b backports-release-1.11`)
