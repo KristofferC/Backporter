@@ -38,13 +38,20 @@ in the middle of the message, but this is not a real trailer."""
             run(`git fetch origin`)
 
             # Test the function
-            commits = get_cherry_picked_commits("1.0").already_backported_commits
+            info = get_cherry_picked_commits("1.0")
+            backported_commits = info.already_backported_commits
+            non_cherry_picks = info.non_cherry_picks
 
+            # Check backported commits
             # Should find exactly one commit (the real trailer)
-            @test length(commits) == 1
-            @test original_hash in commits
+            @test length(backported_commits) == 1
+            @test original_hash in backported_commits
             # Should NOT find the fake "abc123" reference
-            @test !("abc123" in commits)
+            @test !("abc123" in backported_commits)
+
+            # Check non-cherry-picked commits
+            # Should be empty
+            @test isempty(non_cherry_picks)
         end
     end
 
@@ -58,9 +65,18 @@ in the middle of the message, but this is not a real trailer."""
             run(`git remote add origin .`)
             run(`git fetch origin`)
 
-            # Test the function - should return empty set
-            commits = get_cherry_picked_commits("1.0").already_backported_commits
-            @test isempty(commits)
+            # Test the function
+            info = get_cherry_picked_commits("1.0")
+            backported_commits = info.already_backported_commits
+            non_cherry_picks = info.non_cherry_picks
+
+            # Check backported commits
+            # Should return empty set
+            @test isempty(backported_commits)
+
+            # Check non-cherry-picked commits
+            # Should be empty
+            @test isempty(non_cherry_picks)
         end
     end
 
@@ -89,11 +105,22 @@ in the middle of the message, but this is not a real trailer."""
             run(`git remote add origin .`)
             run(`git fetch origin`)
 
-            # Test the function - should find both commits
-            commits = get_cherry_picked_commits("1.0").already_backported_commits
-            @test length(commits) == 2
-            @test hash1 in commits
-            @test hash2 in commits
+            # Test the function
+            info = get_cherry_picked_commits("1.0")
+            backported_commits = info.already_backported_commits
+            non_cherry_picks = info.non_cherry_picks
+
+            # Check backported commits
+            # Should find both commits
+            @test length(backported_commits) == 2
+            @test hash1 in backported_commits
+            @test hash2 in backported_commits
+            # Should NOT find the fake "abc123" reference
+            @test !("abc123" in backported_commits)
+
+            # Check non-cherry-picked commits
+            # Should be empty
+            @test isempty(non_cherry_picks)
         end
     end
 end
