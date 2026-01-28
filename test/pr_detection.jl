@@ -1,6 +1,7 @@
 using Test
 
 # Load the backporter module functions
+# Define ARGS before including to prevent command-line parsing issues
 const original_ARGS = copy(ARGS)
 empty!(ARGS)
 include("../backporter.jl")
