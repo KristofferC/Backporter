@@ -1,6 +1,7 @@
 using Test
 
 # Load the backporter module functions
+# Define ARGS before including to prevent command-line parsing issues
 const original_ARGS = copy(ARGS)
 empty!(ARGS)
 include("../backporter.jl")
@@ -8,21 +9,7 @@ copy!(ARGS, original_ARGS)
 
 @testset "Git operations" begin
     @testset "get_parents" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
+        with_test_repo() do
             commit1 = chomp(read(`git rev-parse HEAD`, String))
 
             # Create second commit
@@ -52,30 +39,11 @@ copy!(ARGS, original_ARGS)
             @test length(merge_parents) == 2
             @test commit2 in merge_parents
             @test feature_commit in merge_parents
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 
     @testset "get_real_hash" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Create second commit
             write("file.txt", "change")
             run(`git add file.txt`)
@@ -100,30 +68,11 @@ copy!(ARGS, original_ARGS)
             real_hash = get_real_hash(merge_commit)
             @test real_hash == feature_commit
             @test real_hash != merge_commit
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 
     @testset "is_working_directory_clean" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Working directory should be clean
             @test is_working_directory_clean()
 
@@ -138,41 +87,18 @@ copy!(ARGS, original_ARGS)
             # Commit the change
             run(`git commit -m "Modification"`)
             @test is_working_directory_clean()
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 
     @testset "branch detection" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
-            # Test default branch (should be 'main' or 'master')
+        with_test_repo() do
+            # Test default branch (should be 'main', because we initialize our test repo as such)
             current = branch()
-            @test current in ["main", "master"]
+            @test current == "main"
 
             # Create and checkout new branch
             run(`git checkout -b backports-release-1.11`)
             @test branch() == "backports-release-1.11"
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 end

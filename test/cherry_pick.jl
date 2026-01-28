@@ -9,23 +9,7 @@ copy!(ARGS, original_ARGS)
 
 @testset "Cherry-pick commit detection" begin
     @testset "cherry_picked_commits with multiline messages" begin
-        # Create a test git repository
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Create release branch
             run(`git branch release-1.0`)
 
@@ -61,31 +45,11 @@ in the middle of the message, but this is not a real trailer."""
             @test original_hash in commits
             # Should NOT find the fake "abc123" reference
             @test !("abc123" in commits)
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 
     @testset "cherry_picked_commits with no commits" begin
-        # Create a test git repository with no cherry-picks
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Create branches
             run(`git branch release-1.0`)
             run(`git branch backports-release-1.0`)
@@ -97,30 +61,11 @@ in the middle of the message, but this is not a real trailer."""
             # Test the function - should return empty set
             commits = cherry_picked_commits("1.0")
             @test isempty(commits)
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 
     @testset "cherry_picked_commits with multiple commits" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Create release branch
             run(`git branch release-1.0`)
 
@@ -149,10 +94,6 @@ in the middle of the message, but this is not a real trailer."""
             @test length(commits) == 2
             @test hash1 in commits
             @test hash2 in commits
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 end

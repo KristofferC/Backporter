@@ -5,12 +5,12 @@ on:
     branches:
       - master
   pull_request:
-    branches:
-      - master
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: Julia ${{ matrix.julia-version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,11 +19,11 @@ jobs:
           - '1.12.4'
         os:
           - ubuntu-latest
-        #   - macOS-latest
-        #   - windows-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Julia
         uses: julia-actions/setup-julia@v2
@@ -35,8 +35,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          julia --project -e 'using Pkg; Pkg.instantiate()'
 
       - name: Run tests
         run: |
-          julia --project=. test/runtests.jl
+          julia --project --code-coverage=@ test/runtests.jl
+
+      - uses: julia-actions/julia-processcoverage@v1.2.2
+        with:
+          directories: .
+
+      - uses: codecov/codecov-action@v5.5.2
+        with:
+          files: lcov.info

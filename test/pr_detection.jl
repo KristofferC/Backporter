@@ -1,6 +1,7 @@
 using Test
 
 # Load the backporter module functions
+# Define ARGS before including to prevent command-line parsing issues
 const original_ARGS = copy(ARGS)
 empty!(ARGS)
 include("../backporter.jl")
@@ -8,22 +9,7 @@ copy!(ARGS, original_ARGS)
 
 @testset "PR detection and categorization" begin
     @testset "detect_version_from_branch" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Test version detection from different branch names
             run(`git checkout -b backports-release-1.11`)
             @test detect_version_from_branch() == "1.11"
@@ -37,30 +23,11 @@ copy!(ARGS, original_ARGS)
             # Test no match
             run(`git checkout -b feature-branch`)
             @test detect_version_from_branch() === nothing
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 
     @testset "detect_repo_from_remote" begin
-        test_dir = mktempdir()
-        original_dir = pwd()
-
-        try
-            cd(test_dir)
-
-            # Initialize repo
-            run(`git init`)
-            run(`git config user.email "test@example.com"`)
-            run(`git config user.name "Test User"`)
-
-            # Create initial commit
-            write("file.txt", "initial")
-            run(`git add file.txt`)
-            run(`git commit -m "Initial commit"`)
-
+        with_test_repo() do
             # Test SSH URL
             run(`git remote add origin git@github.com:JuliaLang/julia.git`)
             @test detect_repo_from_remote() == "JuliaLang/julia"
@@ -68,10 +35,6 @@ copy!(ARGS, original_ARGS)
             # Test HTTPS URL with .git
             run(`git remote set-url origin https://github.com/KristofferC/Backporter.git`)
             @test detect_repo_from_remote() == "KristofferC/Backporter"
-
-        finally
-            cd(original_dir)
-            rm(test_dir; force=true, recursive=true)
         end
     end
 

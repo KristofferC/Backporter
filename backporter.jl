@@ -380,7 +380,7 @@ function detect_repo_from_remote()
         end
 
         # Handle GitHub HTTPS URLs: https://github.com/owner/repo.git
-        m = match(r"https://github\.com/([^/]+/[^/]+)(?:\.git)?", remote_url)
+        m = match(r"https:\/\/github\.com\/([\w]*?\/[\w]*?)(?:\.git)?$", remote_url)
         if m !== nothing
             return m.captures[1]
         end
