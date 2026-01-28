@@ -1,6 +1,10 @@
 using Test
 
 @testset "Backporter Tests" begin
+    # Load some helper functions:
+    include("util.jl")
+
+    # Run the tests:
     include("cherry_pick.jl")
     include("git_operations.jl")
     include("pr_detection.jl")
