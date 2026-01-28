@@ -177,9 +177,17 @@ function cherry_picked_commits(version)
     end
 
     try
-        logg = read(`git log $base...$against --pretty=%B`, String)
-        for match in eachmatch(r"\(cherry picked from commit (.*?)\)", logg)
-            push!(commits, match.captures[1])
+        # Get list of commit hashes first
+        hashes = readlines(`git log $base...$against --format=%H`)
+
+        # For each commit, get its full message and check for cherry-pick trailer
+        for hash in hashes
+            msg = read(`git log -1 --format=%B $hash`, String)
+            # Match cherry-pick trailer only at the end of lines (after newline or start)
+            # This avoids matching the pattern if it appears mid-sentence in the body
+            for match in eachmatch(r"(?:^|\n)\(cherry picked from commit ([a-f0-9]+)\)\s*$"m, msg)
+                push!(commits, match.captures[1])
+            end
         end
     catch e
         error("Failed to get git log between $base and $against: $e")
@@ -372,7 +380,7 @@ function detect_repo_from_remote()
         end
 
         # Handle GitHub HTTPS URLs: https://github.com/owner/repo.git
-        m = match(r"https://github\.com/([^/]+/[^/]+)(?:\.git)?", remote_url)
+        m = match(r"https:\/\/github\.com\/([\w]*?\/[\w]*?)(?:\.git)?$", remote_url)
         if m !== nothing
             return m.captures[1]
         end
@@ -1165,4 +1173,7 @@ function main(args)
     end
 end
 
-main(ARGS)
+# Only run main if this file is being executed directly (not included)
+if abspath(PROGRAM_FILE) == @__FILE__
+    main(ARGS)
+end
