@@ -678,7 +678,7 @@ function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
     end
 
     if !isempty(successful_backports)
-        println("The following PRs where backported to this branch:")
+        println("The following PRs were backported to this branch:")
         for pr in successful_backports
             println("    #$(pr.number) - $(pr.html_url)")
         end
