@@ -443,25 +443,16 @@ function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfi
 end
 
 function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig, auth::GitHubAuthenticator)
-
     try
-        headers = Dict()
-        GitHub.authenticate_headers!(headers, authenticate!(auth, config))
-        headers["User-Agent"] = "GitHub-jl"
+        auth_ref = authenticate!(auth, config)
 
-        req = HTTP.request("GET", "https://api.github.com/search/issues?q=$hash+type:pr+repo:$(config.repo)";
-                     headers = headers, connect_timeout=30, read_timeout=60)
+        request_path = "/search/issues?q=$hash+type:pr+repo:$(config.repo)"
+        json = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
 
-        if req.status != 200
-            @warn "GitHub API request failed with status $(req.status)"
-            return nothing
-        end
-
-        json = JSON.parse(String(req.body))
         if json["total_count"] !== 1
             return nothing
         end
-        item = json["items"][1]
+        item = only(json["items"])
         if !haskey(item, "pull_request")
             return nothing
         end
@@ -494,23 +485,11 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
 
     while true
         query = "repo:$(config.repo)+is:pr+label:%22$backport_label_encoded%22"
-        search_url = "https://api.github.com/search/issues?q=$query&per_page=100&page=$page"
-        headers = Dict("Authorization" => "token $(config.github_auth)")
+        search_path = "/search/issues?q=$query&per_page=100&page=$page"
+        auth_ref = authenticate!(auth, config)
 
         try
-            response = HTTP.get(search_url, headers=headers, connect_timeout=30, read_timeout=60)
-            if response.status != 200
-                error("Failed to fetch PRs (HTTP $(response.status)): $(String(response.body))")
-            end
-            data = JSON.parse(String(response.body))
-
-            # Handle API rate limiting
-            if haskey(data, "message") && occursin("rate limit", lowercase(data["message"]))
-                @warn "GitHub API rate limit exceeded. Waiting 60 seconds..."
-                sleep(60)
-                continue
-            end
-
+            data = GitHub.gh_get_json(GitHub.DEFAULT_API, search_path; auth=auth_ref)
             append!(prs, data["items"])
 
             # Check if there are more pages
@@ -756,12 +735,8 @@ function LabelAuditConfig(version::String, repo::String)
     LabelAuditConfig(version, repo, github_auth, backport_label, release_branch)
 end
 
-function audit_github_headers(auth::String)
-    return Dict(
-        "Authorization" => "token $auth",
-        "Accept" => "application/vnd.github+json",
-        "User-Agent" => "Backporter.jl"
-    )
+function get_github_auth(auth::String)
+    return GitHub.authenticate(auth)
 end
 
 function find_backport_versions(repo::String, github_auth::String)
@@ -770,9 +745,9 @@ function find_backport_versions(repo::String, github_auth::String)
 
     page = 1
     while true
-        url = "https://api.github.com/repos/$repo/labels?per_page=100&page=$page"
-        response = HTTP.get(url; headers=audit_github_headers(github_auth))
-        data = JSON.parse(String(response.body))
+        auth_ref = get_github_auth(github_auth)
+        request_path = "/repos/$repo/labels?per_page=100&page=$page"
+        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
 
         isempty(data) && break
 
@@ -894,10 +869,10 @@ function get_labeled_closed_prs(config::LabelAuditConfig)
 
     page = 1
     while true
+        auth_ref = get_github_auth(config.github_auth)
         query = URIs.escapeuri("repo:$(config.repo) is:pr is:closed label:\"$(config.backport_label)\"")
-        url = "https://api.github.com/search/issues?q=$query&per_page=100&page=$page"
-        response = HTTP.get(url; headers=audit_github_headers(config.github_auth))
-        data = JSON.parse(String(response.body))
+        request_path = "/search/issues?q=$query&per_page=100&page=$page"
+        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
 
         items = get(data, "items", [])
         isempty(items) && break
@@ -913,9 +888,10 @@ function get_labeled_closed_prs(config::LabelAuditConfig)
 end
 
 function remove_backport_label(config::LabelAuditConfig, pr_number::Int)
+    auth_ref = get_github_auth(config.github_auth)
     encoded_label = URIs.escapeuri(config.backport_label)
-    url = "https://api.github.com/repos/$(config.repo)/issues/$pr_number/labels/$encoded_label"
-    HTTP.request("DELETE", url; headers=audit_github_headers(config.github_auth))
+    request_path = "/repos/$(config.repo)/issues/$pr_number/labels/$encoded_label"
+    GitHub.gh_delete(GitHub.DEFAULT_API, request_path; auth=auth_ref)
 end
 
 struct AuditResult
