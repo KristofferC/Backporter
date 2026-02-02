@@ -460,7 +460,7 @@ function find_pr_associated_with_commit(hash::AbstractString, config::BackportCo
         pr = parse(Int, basename(item["pull_request"]["url"]))
         return pr
     catch e
-        @warn "Failed to find PR for commit $hash: $e"
+        error("Failed to find PR for commit $hash: $e")
         return nothing
     end
 end
@@ -517,7 +517,7 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
             try
                 GitHub.pull_request(config.repo, pr_number; auth=auth_ref)
             catch e
-                @warn "Failed to fetch PR #$pr_number: $e"
+                error("Failed to fetch PR #$pr_number: $e")
                 nothing
             end
         end
@@ -968,7 +968,7 @@ function apply_audit_changes(result::AuditResult, config::LabelAuditConfig)
             remove_backport_label(config, pr_num)
             println("  Removed label from #$pr_num")
         catch e
-            println("  Error processing #$pr_num: $e")
+            error("Error processing #$pr_num: $e")
         end
     end
 
