@@ -162,9 +162,14 @@ end
 # ============================================================================
 # Git Operations
 # ============================================================================
-function cherry_picked_commits(version)
-    commits = Set{String}()
 
+Base.@kwdef struct NonCherryPickedCommit
+    sha::String
+    title::String
+    pr_num::String
+end
+
+function get_cherry_picked_commits(version)
     base = "origin/release-$version"
     against = "backports-release-$version"
 
@@ -176,23 +181,47 @@ function cherry_picked_commits(version)
         error("Target branch '$against' does not exist")
     end
 
-    try
-        # Get list of commit hashes first
-        hashes = readlines(`git log $base...$against --format=%H`)
+    already_backported_commits = Set{String}()
+    non_cherry_picks = NonCherryPickedCommit[]
 
-        # For each commit, get its full message and check for cherry-pick trailer
-        for hash in hashes
-            msg = read(`git log -1 --format=%B $hash`, String)
-            # Match cherry-pick trailer only at the end of lines (after newline or start)
-            # This avoids matching the pattern if it appears mid-sentence in the body
-            for match in eachmatch(r"(?:^|\n)\(cherry picked from commit ([a-f0-9]+)\)\s*$"m, msg)
-                push!(commits, match.captures[1])
-            end
-        end
-    catch e
-        error("Failed to get git log between $base and $against: $e")
+    log_str = read(`git log --oneline --pretty=format:"%H" $base...$against`, String)
+    if isempty(log_str)
+        @warn "No commits found when comparing $against to $base. Maybe the backports branch has no commits?"
+        hashes = []
+    else
+        hashes = split(log_str, '\n')
     end
-    return commits
+    for hash in hashes
+        # For each commit, get its full message and check for cherry-pick trailer
+        msg = read(`git rev-list --format="%B" --max-count=1 $hash`, String)
+        found_match = false
+        # Match cherry-pick trailer only at the end of lines (after newline or start)
+        # This avoids matching the pattern if it appears mid-sentence in the body
+        for match in eachmatch(r"(?:^|\n)\(cherry picked from commit ([a-f0-9]+)\)\s*$"m, msg)
+            found_match = true
+            push!(already_backported_commits, match.captures[1])
+        end
+        if !found_match
+            # Line 1 is the `commit abc123...` line
+            # So we use line 2 instead
+            title = strip(commit_message_lines[2])
+            m = match(r"\(#(\d*?)\)$", title)
+            if m === nothing
+                commit_info = NonCherryPickedCommit(; sha = commit, title)
+            else
+                pr_num = m[1]
+                commit_info = NonCherryPickedCommit(; sha = commit, title, pr_num)
+            end
+            push!(non_cherry_picks, commit_info)
+        end
+    end
+
+    unique!(non_cherry_picks)
+    # git log is in reverse chronological order by default
+    # but for our printing (later, in the PR description),
+    # we'd prefer to use chrononological order
+    reverse!(non_cherry_picks)
+    return (; already_backported_commits, non_cherry_picks)
 end
 
 function get_parents(hash::AbstractString)
@@ -536,7 +565,7 @@ end
 
 # Categorize PRs into: open, closed (unmerged), already backported, and candidates for backporting
 function categorize_prs(prs, config::BackportConfig)
-    already_backported_commits = cherry_picked_commits(config.backport_version)
+    (; already_backported_commits, non_cherry_picks) = get_cherry_picked_commits(config.backport_version)
     open_prs = []
     closed_prs = []
     already_backported = []
@@ -556,18 +585,23 @@ function categorize_prs(prs, config::BackportConfig)
         end
     end
 
-    return (; open_prs, closed_prs, already_backported, backport_candidates)
+    return (; open_prs, closed_prs, already_backported, backport_candidates, non_cherry_picks)
 end
 
 function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthenticator)
     # Analyze PRs without making changes (for dry-run mode)
-    (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
+    (; open_prs,
+       closed_prs,
+       already_backported,
+       backport_candidates,
+       non_cherry_picks) = categorize_prs(prs, config)
 
     println("Analysis Results:")
     println("  Open PRs: $(length(open_prs))")
     println("  Closed/unmerged PRs: $(length(closed_prs))")
     println("  Already backported: $(length(already_backported))")
     println("  Backport candidates: $(length(backport_candidates))")
+    println("  Manual non-cherry-picks: $(length(non_cherry_picks))")
 
     # Show what would be done without actually doing it
     if !isempty(backport_candidates)
@@ -594,7 +628,11 @@ function test_single_commit(commit_hash::String, options::CLIOptions)
 end
 
 function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
-    (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
+    (; open_prs,
+       closed_prs,
+       already_backported,
+       backport_candidates,
+       non_cherry_picks) = categorize_prs(prs, config)
 
     sort!(closed_prs; by = x -> x.number)
     sort!(already_backported; by = x -> x.merged_at)
@@ -679,12 +717,30 @@ function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
         println("- [$(checked ? "x" : " ")] #$(pr.number) <!-- $(pr.title) -->")
     end
 
+    function summarize_commit(commit::NonCherryPickedCommit)
+        if commit.pr_num === nothing
+            # Use double backticks, just in case the commit title includes some single backticks
+            description = "``$(commit.title)``"
+        else
+            description = "#$(commit.pr_num) <!-- $(commit.title) -->"
+        end
+        println("- [x] $(commit.sha): $description")
+    end
+
     backported_prs = [successful_backports; already_backported]
     if !isempty(backported_prs)
         sort!(backported_prs; by = x -> x.merged_at)
         println("Backported PRs:")
         for pr in backported_prs
             summarize_pr(pr)
+        end
+    end
+
+    if !isempty(non_cherry_picks)
+        println()
+        println("Manual non-cherry-picks:")
+        for commit in non_cherry_picks
+            summarize_commit(commit)
         end
     end
 
