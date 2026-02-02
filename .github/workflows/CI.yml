@@ -48,3 +48,44 @@ jobs:
       - uses: codecov/codecov-action@v5.5.2
         with:
           files: lcov.info
+
+  integration:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version:
+          - '1.12.4'
+        os:
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia artifacts
+        uses: julia-actions/cache@v2
+
+      - name: Install dependencies
+        run: |
+          julia --project -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Run integration tests
+        run: |
+          julia --project --code-coverage=@ test/integration.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # - uses: julia-actions/julia-processcoverage@v1.2.2
+      #   with:
+      #     directories: .
+
+      # - uses: codecov/codecov-action@v5.5.2
+      #   with:
+      #     files: lcov.info
