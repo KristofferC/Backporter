@@ -33,19 +33,29 @@ using Dates: now
 # Configuration
 # ============================================================================
 
+function get_github_auth_from_env()
+    str = get(ENV, "GITHUB_TOKEN", "")
+    if isempty(str)
+        error("GITHUB_TOKEN environment variable must be set")
+    end
+    auth = try
+        GitHub.authenticate(github_auth)
+    catch e
+        error("Failed to authenticate with GitHub: $e. Please check your GITHUB_TOKEN.")
+    end
+    return auth
+end
+
 struct BackportConfig
     backport_version::String
     repo::String
     backport_label::String
-    github_auth::String
+    auth::GitHub.Authorization # This is an abstract type, but that's okay
 end
 function BackportConfig(backport_version::AbstractString, repo::AbstractString="JuliaLang/julia")
-    github_auth = get(ENV, "GITHUB_TOKEN", "")
-    if isempty(github_auth)
-        error("GITHUB_TOKEN environment variable must be set")
-    end
+    auth = get_github_auth_from_env()
     backport_label = "backport $backport_version"
-    BackportConfig(backport_version, repo, backport_label, github_auth)
+    BackportConfig(backport_version, repo, backport_label, auth)
 end
 
 # ============================================================================
@@ -425,29 +435,10 @@ end
 # Data Structures
 # ============================================================================
 
-# GitHub authentication
-struct GitHubAuthenticator
-    auth::Ref{GitHub.Authorization}
-end
-GitHubAuthenticator() = GitHubAuthenticator(Ref{GitHub.Authorization}())
-
-function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfig)
-    if !isassigned(authenticator.auth)
-        try
-            authenticator.auth[] = GitHub.authenticate(config.github_auth)
-        catch e
-            error("Failed to authenticate with GitHub: $e. Please check your GITHUB_TOKEN.")
-        end
-    end
-    return authenticator.auth[]
-end
-
-function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig, auth::GitHubAuthenticator)
+function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig)
     try
-        auth_ref = authenticate!(auth, config)
-
         request_path = "/search/issues?q=$hash+type:pr+repo:$(config.repo)"
-        json = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
+        json = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=config.auth)
 
         if json["total_count"] !== 1
             return nothing
@@ -465,12 +456,12 @@ function find_pr_associated_with_commit(hash::AbstractString, config::BackportCo
     end
 end
 
-function was_squashed_pr(pr, config::BackportConfig, auth::GitHubAuthenticator)
+function was_squashed_pr(pr, config::BackportConfig)
     parents = get_parents(pr.merge_commit_sha)
     if length(parents) != 1
         return false
     end
-    return pr.number != find_pr_associated_with_commit(parents[1], config, auth)
+    return pr.number != find_pr_associated_with_commit(parents[1], config)
 end
 
 
@@ -478,7 +469,7 @@ end
 # GitHub API Functions
 # ============================================================================
 
-function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
+function collect_label_prs(config::BackportConfig)
     prs = []
     page = 1
     backport_label_encoded = replace(config.backport_label, " " => "+")
@@ -486,10 +477,9 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
     while true
         query = "repo:$(config.repo)+is:pr+label:%22$backport_label_encoded%22"
         search_path = "/search/issues?q=$query&per_page=100&page=$page"
-        auth_ref = authenticate!(auth, config)
 
         try
-            data = GitHub.gh_get_json(GitHub.DEFAULT_API, search_path; auth=auth_ref)
+            data = GitHub.gh_get_json(GitHub.DEFAULT_API, search_path; auth=config.auth)
             append!(prs, data["items"])
 
             # Check if there are more pages
@@ -512,10 +502,9 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
         println("Fetching $(length(pr_numbers)) PRs in parallel...")
 
         # Fetch PRs in parallel using asyncmap
-        auth_ref = authenticate!(auth, config)
         detailed_prs = asyncmap(pr_numbers; ntasks=min(20, length(pr_numbers))) do pr_number
             try
-                GitHub.pull_request(config.repo, pr_number; auth=auth_ref)
+                GitHub.pull_request(config.repo, pr_number; auth=config.auth)
             catch e
                 @warn "Failed to fetch PR #$pr_number: $e"
                 nothing
@@ -529,9 +518,9 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
     end
 end
 
-function do_backporting(config::BackportConfig, auth::GitHubAuthenticator)
-    label_prs = collect_label_prs(config, auth)
-    _do_backporting(label_prs, config, auth)
+function do_backporting(config::BackportConfig)
+    label_prs = collect_label_prs(config)
+    _do_backporting(label_prs, config)
 end
 
 # Categorize PRs into: open, closed (unmerged), already backported, and candidates for backporting
@@ -559,7 +548,7 @@ function categorize_prs(prs, config::BackportConfig)
     return (; open_prs, closed_prs, already_backported, backport_candidates)
 end
 
-function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthenticator)
+function _do_backporting_analysis(prs, config::BackportConfig)
     # Analyze PRs without making changes (for dry-run mode)
     (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
 
@@ -593,7 +582,7 @@ function test_single_commit(commit_hash::String, options::CLIOptions)
     end
 end
 
-function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
+function _do_backporting(prs, config::BackportConfig)
     (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
 
     sort!(closed_prs; by = x -> x.number)
@@ -607,13 +596,13 @@ function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
         if pr.commits === nothing
             # Handle case where commits field is missing - refetch PR
             i = findfirst(x -> x.number == pr.number, prs)
-            pr = GitHub.pull_request(config.repo, pr.number; auth=authenticate!(auth, config))
+            pr = GitHub.pull_request(config.repo, pr.number; auth=config.auth)
             @assert pr.commits !== nothing
             prs[i] = pr
         end
         if pr.commits != 1
             # Check if this was squashed - we can still backport squashed PRs
-            if was_squashed_pr(pr, config, auth) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
+            if was_squashed_pr(pr, config) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
                 push!(successful_backports, pr)
             else
                 push!(multi_commit_prs, pr)
@@ -720,34 +709,26 @@ end
 struct LabelAuditConfig
     version::String
     repo::String
-    github_auth::String
+    auth::GitHub.Authorization # This is an abstract type, but that's okay
     backport_label::String
     release_branch::String
 end
 
 function LabelAuditConfig(version::String, repo::String)
-    github_auth = get(ENV, "GITHUB_TOKEN", "")
-    if isempty(github_auth)
-        error("GITHUB_TOKEN environment variable must be set")
-    end
+    auth = get_github_auth_from_env()
     backport_label = "backport $version"
     release_branch = "release-$version"
-    LabelAuditConfig(version, repo, github_auth, backport_label, release_branch)
+    LabelAuditConfig(version, repo, auth, backport_label, release_branch)
 end
 
-function get_github_auth(auth::String)
-    return GitHub.authenticate(auth)
-end
-
-function find_backport_versions(repo::String, github_auth::String)
+function find_backport_versions(repo::String, auth::GitHub.Authorization)
     versions = String[]
     println("Discovering backport labels...")
 
     page = 1
     while true
-        auth_ref = get_github_auth(github_auth)
         request_path = "/repos/$repo/labels?per_page=100&page=$page"
-        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
+        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth)
 
         isempty(data) && break
 
@@ -869,10 +850,9 @@ function get_labeled_closed_prs(config::LabelAuditConfig)
 
     page = 1
     while true
-        auth_ref = get_github_auth(config.github_auth)
         query = URIs.escapeuri("repo:$(config.repo) is:pr is:closed label:\"$(config.backport_label)\"")
         request_path = "/search/issues?q=$query&per_page=100&page=$page"
-        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
+        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=config.auth)
 
         items = get(data, "items", [])
         isempty(items) && break
@@ -888,10 +868,9 @@ function get_labeled_closed_prs(config::LabelAuditConfig)
 end
 
 function remove_backport_label(config::LabelAuditConfig, pr_number::Int)
-    auth_ref = get_github_auth(config.github_auth)
     encoded_label = URIs.escapeuri(config.backport_label)
     request_path = "/repos/$(config.repo)/issues/$pr_number/labels/$encoded_label"
-    GitHub.gh_delete(GitHub.DEFAULT_API, request_path; auth=auth_ref)
+    GitHub.gh_delete(GitHub.DEFAULT_API, request_path; auth=config.auth)
 end
 
 struct AuditResult
@@ -1041,12 +1020,8 @@ function run_audit_mode(options::CLIOptions)
             error("--cleanup-pr requires --version to be specified")
         end
 
-        github_auth = get(ENV, "GITHUB_TOKEN", "")
-        if isempty(github_auth)
-            error("GITHUB_TOKEN environment variable must be set")
-        end
-
-        versions = find_backport_versions(repo, github_auth)
+        auth = get_github_auth_from_env()
+        versions = find_backport_versions(repo, auth)
 
         if isempty(versions)
             println("No backport labels found in $repo")
@@ -1129,17 +1104,16 @@ function main(args)
     end
 
     try
-        auth = GitHubAuthenticator()
         start_time = time()
-        prs = collect_label_prs(config, auth)
+        prs = collect_label_prs(config)
         println("Collected $(length(prs)) PRs in $(round(time() - start_time, digits=1))s")
 
         if options.dry_run
             println("\n[DRY RUN] Would perform backporting operations for $(length(prs)) PRs")
             # Still show the analysis but don't actually cherry-pick
-            _do_backporting_analysis(prs, config, auth)
+            _do_backporting_analysis(prs, config)
         else
-            _do_backporting(prs, config, auth)
+            _do_backporting(prs, config)
         end
 
         total_time = time() - start_time
