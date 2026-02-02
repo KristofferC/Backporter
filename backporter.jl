@@ -490,7 +490,7 @@ function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
 
         try
             data = GitHub.gh_get_json(GitHub.DEFAULT_API, search_path; auth=auth_ref)
-            append!(prs, data.items)
+            append!(prs, data["items"])
 
             # Check if there are more pages
             if !haskey(data, "items") || isempty(data["items"])
