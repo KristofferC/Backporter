@@ -31,7 +31,7 @@ jobs:
           version: ${{ matrix.julia-version }}
 
       - name: Cache Julia artifacts
-        uses: julia-actions/cache@v2
+        uses: julia-actions/cache@v3
 
       - name: Install dependencies
         run: |
@@ -45,6 +45,6 @@ jobs:
         with:
           directories: .
 
-      - uses: codecov/codecov-action@v5.5.2
+      - uses: codecov/codecov-action@v6.0.0
         with:
           files: lcov.info
