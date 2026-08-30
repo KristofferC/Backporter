@@ -118,6 +118,12 @@ end
     @test !occursin("Backported PRs:", s)
 end
 
+@testset "urlencode" begin
+    @test urlencode("backport 1.13") == "backport%201.13"
+    @test urlencode("plain-label_1.0~x") == "plain-label_1.0~x"
+    @test urlencode("a/b&c") == "a%2Fb%26c"
+end
+
 @testset "replace_marked_section" begin
     section = "Backported PRs:\n- [x] #1 <!-- t -->"
     wrapped = "$MARK_BEGIN\n$section\n$MARK_END"

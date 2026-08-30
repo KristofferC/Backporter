@@ -459,6 +459,19 @@ function replace_marked_section(body::AbstractString, section::AbstractString)
     return string(b[1:prevind(b, first(i))], wrapped, b[last(j)+1:end])
 end
 
+function urlencode(s::AbstractString)
+    io = IOBuffer()
+    for b in codeunits(s)
+        c = Char(b)
+        if c in 'a':'z' || c in 'A':'Z' || c in '0':'9' || c in "-._~"
+            write(io, c)
+        else
+            print(io, '%', uppercase(string(b; base=16, pad=2)))
+        end
+    end
+    return String(take!(io))
+end
+
 function find_tracking_pr(repo, branch)
     out = capture(`gh pr list -R $repo --head $branch --state open --json number --jq ".[0].number // empty"`)
     return isempty(strip(out)) ? nothing : parse(Int, strip(out))
@@ -477,7 +490,9 @@ function update_tracking_pr(repo, prnum, section)
     try
         write(io, new_body)
         close(io)
-        capture(`gh pr edit $prnum -R $repo --body-file $path`)
+        # REST, not `gh pr edit`: the latter runs a GraphQL metadata query that
+        # requires the read:org token scope.
+        capture(`gh api -X PATCH repos/$repo/pulls/$prnum -F body=@$path`)
     finally
         rm(path; force=true)
     end
@@ -645,7 +660,7 @@ function run_audit(opts::Options)
         println("Nothing to clean up.")
     elseif opts.apply
         for pr in released
-            capture(`gh pr edit $(pr.number) -R $repo --remove-label $label`)
+            capture(`gh api -X DELETE repos/$repo/issues/$(pr.number)/labels/$(urlencode(label))`)
             println("Removed \"$label\" from #$(pr.number)")
         end
     else
