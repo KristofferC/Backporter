@@ -1,99 +1,60 @@
 using Test
 
-# Load the backporter module functions
-# Define ARGS before including to prevent command-line parsing issues
-const original_ARGS = copy(ARGS)
-empty!(ARGS)
-include("../backporter.jl")
-copy!(ARGS, original_ARGS)
+@testset "try_cherry_pick" begin
+    with_test_repo() do
+        base = readchomp(`git rev-parse HEAD`)
+        clean_sha = commit_file("new.txt", "new content", "Clean pick (#1)")
+        conflict_sha = commit_file("file.txt", "conflicting", "Conflicting pick (#2)")
 
-@testset "Cherry-pick commit detection" begin
-    @testset "cherry_picked_commits with multiline messages" begin
-        with_test_repo() do
-            # Create release branch
-            run(`git branch release-1.0`)
+        git_quiet("checkout", "-b", "bp", base)
 
-            # Create a commit on main with multiline message containing fake cherry-pick reference
-            write("file.txt", "change1")
-            run(`git add file.txt`)
-            multiline_msg = """Feature commit
+        # clean pick, with the -x trailer recorded
+        @test try_cherry_pick(clean_sha) == :picked
+        msg = readchomp(`git log -1 --format=%B`)
+        @test occursin("Clean pick (#1)", msg)
+        @test occursin("(cherry picked from commit $clean_sha)", msg)
 
-This is a longer description
-with multiple lines.
+        # picking the same change again comes up empty
+        @test try_cherry_pick(clean_sha) == :empty
+        @test worktree_clean()
+        @test readchomp(`git log -1 --format=%s`) == "Clean pick (#1)"
 
-Someone might write (cherry picked from commit abc123)
-in the middle of the message, but this is not a real trailer."""
-            run(`git commit -m $multiline_msg`)
+        # conflicting pick: reports :conflict and leaves a clean tree behind
+        commit_file("file.txt", "diverged", "Diverge file.txt")
+        head_before = readchomp(`git rev-parse HEAD`)
+        @test try_cherry_pick(conflict_sha) == :conflict
+        @test worktree_clean()
+        @test readchomp(`git rev-parse HEAD`) == head_before
+        @test !isfile(".git/CHERRY_PICK_HEAD")
 
-            original_hash = chomp(read(`git rev-parse HEAD`, String))
-
-            # Create backport branch
-            run(`git checkout -b backports-release-1.0 release-1.0`)
-
-            # Cherry-pick the commit with -x flag to add proper trailer
-            run(`git cherry-pick -x $original_hash`)
-
-            # Add origin remote
-            run(`git remote add origin .`)
-            run(`git fetch origin`)
-
-            # Test the function
-            commits = cherry_picked_commits("1.0")
-
-            # Should find exactly one commit (the real trailer)
-            @test length(commits) == 1
-            @test original_hash in commits
-            # Should NOT find the fake "abc123" reference
-            @test !("abc123" in commits)
-        end
+        # merge commits need mainline
+        git_quiet("checkout", "-b", "feature", base)
+        feat = commit_file("feat.txt", "feature", "Feature work")
+        git_quiet("checkout", "main")
+        git_quiet("merge", "--no-ff", "-m", "Merge pull request #3 from x/y", "feature")
+        merge_sha = readchomp(`git rev-parse HEAD`)
+        git_quiet("checkout", "bp")
+        @test try_cherry_pick(merge_sha; mainline=true) == :picked
+        @test isfile("feat.txt")
     end
+end
 
-    @testset "cherry_picked_commits with no commits" begin
-        with_test_repo() do
-            # Create branches
-            run(`git branch release-1.0`)
-            run(`git branch backports-release-1.0`)
+@testset "pick_all!" begin
+    with_test_repo() do
+        base = readchomp(`git rev-parse HEAD`)
+        ok_sha = commit_file("x.txt", "xxx", "Good change (#10)")
+        bad_sha = commit_file("file.txt", "master version", "Bad change (#11)")
 
-            # Add origin remote
-            run(`git remote add origin .`)
-            run(`git fetch origin`)
+        git_quiet("checkout", "-b", "bp", base)
+        commit_file("file.txt", "bp version", "Diverge")
 
-            # Test the function - should return empty set
-            commits = cherry_picked_commits("1.0")
-            @test isempty(commits)
-        end
-    end
-
-    @testset "cherry_picked_commits with multiple commits" begin
-        with_test_repo() do
-            # Create release branch
-            run(`git branch release-1.0`)
-
-            # Create two commits on main
-            write("file.txt", "change1")
-            run(`git add file.txt`)
-            run(`git commit -m "First feature"`)
-            hash1 = chomp(read(`git rev-parse HEAD`, String))
-
-            write("file.txt", "change2")
-            run(`git add file.txt`)
-            run(`git commit -m "Second feature"`)
-            hash2 = chomp(read(`git rev-parse HEAD`, String))
-
-            # Create backport branch and cherry-pick both
-            run(`git checkout -b backports-release-1.0 release-1.0`)
-            run(`git cherry-pick -x $hash1`)
-            run(`git cherry-pick -x $hash2`)
-
-            # Add origin remote
-            run(`git remote add origin .`)
-            run(`git fetch origin`)
-
-            # Test the function - should find both commits
-            commits = cherry_picked_commits("1.0")
-            @test length(commits) == 2
-            @test hash1 in commits
-            @test hash2 in commits
-        end
+        mkpr(n, mc) = PR(n, "MERGED", "2026-01-0$(n-9)T00:00:00Z", mc, 1, [mc], "u", "t$n")
+        res = pick_all!([mkpr(10, ok_sha), mkpr(11, bad_sha), mkpr(12, "f"^40)])
+        @test [pr.number for pr in res.picked] == [10]
+        @test isempty(res.squashed)
+        @test isempty(res.empty)
+        @test [pr.number for (pr, _) in res.failed] == [11, 12]
+        @test occursin("git cherry-pick -x $bad_sha", res.failed[1][2])
+        @test occursin("not found locally", res.failed[2][2])
     end
 end
