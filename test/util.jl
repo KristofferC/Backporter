@@ -5,20 +5,26 @@ function with_test_repo(f::Function)
     try
         cd(test_dir)
 
-        # Initialize repo
-        run(`git init --initial-branch=main`)
+        run(`git init --quiet --initial-branch=main`)
         run(`git config user.email "test@example.com"`)
         run(`git config user.name "Test User"`)
+        run(`git config commit.gpgsign false`)
 
-        # Create initial commit
-        write("file.txt", "initial")
-        run(`git add file.txt`)
-        run(`git commit -m "Initial commit"`)
+        commit_file("file.txt", "initial", "Initial commit")
 
-        # Run the user-provided function:
         f()
     finally
         cd(original_dir)
         rm(test_dir; force=true, recursive=true)
     end
 end
+
+# Commits a single file and returns the commit sha
+function commit_file(name, content, msg)
+    write(name, content)
+    run(`git add $name`)
+    run(pipeline(`git commit --quiet -m $msg`; stdout=devnull))
+    return readchomp(`git rev-parse HEAD`)
+end
+
+git_quiet(args...) = run(pipeline(`git $(collect(args))`; stdout=devnull, stderr=devnull))

@@ -1,1155 +1,688 @@
-#!/usr/bin/env -S julia
-"""
-Julia Backporter Tool
+#!/usr/bin/env julia
 
-A CLI tool for backporting Julia PRs to release branches.
-Automatically detects target version and repository from git context.
+# Backporter — reconcile "backport X.Y"-labeled PRs with the backports-release-X.Y branch.
+#
+# Requires `git` and an authenticated GitHub CLI (`gh`). No Julia package dependencies.
+# Run it from the root of a julia checkout.
+#
+# Default mode:
+#   - fetches all PRs carrying the backport label (one GraphQL query)
+#   - determines which are already on the backports branch, using three signals:
+#       1. PR number in commit subjects ("... (#12345)"), which survives conflict
+#          resolution and rewritten commits
+#       2. "(cherry picked from commit <sha>)" trailers, matched against both the
+#          merge commit and the individual PR commits
+#       3. patch-id equivalence, catching clean picks made without `-x`
+#   - if the backports branch is checked out (and not --dry-run): cherry-picks the
+#     remaining candidates
+#   - prints a report and regenerates the tracking PR body between
+#     BACKPORTER:BEGIN/END markers (the section is a pure function of the current
+#     state, so it can never go stale; text outside the markers is left alone)
+#
+# Audit mode (--audit):
+#   - finds labeled PRs whose backports have shipped (present on release-X.Y, or in
+#     a given backports PR via --cleanup-pr N) and removes their labels with --apply.
 
-Requires GITHUB_TOKEN environment variable to be set.
-
-This script has been significantly refactored from its original ad-hoc form (with AI assistance):
-- Added proper CLI interface with argument parsing
-- Implemented smart defaults (auto-detect version from branch, repo from git remote)
-- Added configuration management and error handling
-- Parallel PR fetching for better performance
-- Safety checks (branch validation, clean working directory)
-- Automatic fetch/rebase before starting backports
-- Proper project environment activation with symlink resolution
-"""
-
-# Activate the project environment in the script's directory (resolve symlinks)
-import Pkg
-script_dir = dirname(realpath(@__FILE__))
-Pkg.activate(script_dir)
-
-import GitHub
-import Dates
-import JSON
-import HTTP
-import URIs
-using Dates: now
+using Dates
 
 # ============================================================================
-# Configuration
+# Subprocess helpers
 # ============================================================================
 
-struct BackportConfig
-    backport_version::String
-    repo::String
-    backport_label::String
-    github_auth::String
-end
-function BackportConfig(backport_version::AbstractString, repo::AbstractString="JuliaLang/julia")
-    github_auth = get(ENV, "GITHUB_TOKEN", "")
-    if isempty(github_auth)
-        error("GITHUB_TOKEN environment variable must be set")
-    end
-    backport_label = "backport $backport_version"
-    BackportConfig(backport_version, repo, backport_label, github_auth)
+struct ProcResult
+    ok::Bool
+    out::String
+    err::String
 end
 
+function runproc(cmd::Base.AbstractCmd)
+    out = IOBuffer()
+    err = IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
+    return ProcResult(success(p), String(take!(out)), String(take!(err)))
+end
+
+function capture(cmd::Base.AbstractCmd)
+    r = runproc(cmd)
+    r.ok || error("command failed: $cmd\n$(r.err)")
+    return chomp(r.out)
+end
+
+runok(cmd::Base.AbstractCmd) = runproc(cmd).ok
+
 # ============================================================================
-# Command Line Interface
+# CLI
 # ============================================================================
 
-struct CLIOptions
-    version::Union{String, Nothing}
-    repo::Union{String, Nothing}
-    help::Bool
-    dry_run::Bool
-    validate_branch::Bool
-    require_clean::Bool
-    test_commit::Union{String, Nothing}
-    audit::Bool                         # Run label audit mode
-    cleanup_pr::Union{Int, Nothing}     # PR number for cleanup mode
+Base.@kwdef mutable struct Options
+    version::Union{String,Nothing} = nothing
+    repo::Union{String,Nothing} = nothing
+    dry_run::Bool = false
+    fetch::Bool = true
+    update_pr::Bool = true
+    audit::Bool = false
+    apply::Bool = false
+    cleanup_pr::Union{Int,Nothing} = nothing
+    help::Bool = false
 end
 
 function parse_cli_args(args::Vector{String})
-    options = CLIOptions(nothing, nothing, false, false, true, true, nothing, false, nothing)
-
+    opts = Options()
     i = 1
+    needsarg(flag) = i < length(args) ? args[i += 1] : error("$flag requires a value")
     while i <= length(args)
         arg = args[i]
-        if arg == "--help" || arg == "-h"
-            options = CLIOptions(options.version, options.repo, true, options.dry_run, options.validate_branch, options.require_clean, options.test_commit, options.audit, options.cleanup_pr)
-        elseif arg == "--version" || arg == "-v"
-            if i + 1 <= length(args)
-                options = CLIOptions(args[i+1], options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean, options.test_commit, options.audit, options.cleanup_pr)
-                i += 1
-            else
-                error("--version requires a value")
-            end
-        elseif arg == "--repo" || arg == "-r"
-            if i + 1 <= length(args)
-                options = CLIOptions(options.version, args[i+1], options.help, options.dry_run, options.validate_branch, options.require_clean, options.test_commit, options.audit, options.cleanup_pr)
-                i += 1
-            else
-                error("--repo requires a value")
-            end
-        elseif arg == "--test-commit" || arg == "-t"
-            if i + 1 <= length(args)
-                options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean, args[i+1], options.audit, options.cleanup_pr)
-                i += 1
-            else
-                error("--test-commit requires a commit hash")
-            end
-        elseif arg == "--dry-run" || arg == "-n"
-            options = CLIOptions(options.version, options.repo, options.help, true, options.validate_branch, options.require_clean, options.test_commit, options.audit, options.cleanup_pr)
-        elseif arg == "--no-validate-branch"
-            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, false, options.require_clean, options.test_commit, options.audit, options.cleanup_pr)
-        elseif arg == "--no-require-clean"
-            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, false, options.test_commit, options.audit, options.cleanup_pr)
-        elseif arg == "--audit" || arg == "-a"
-            options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean, options.test_commit, true, options.cleanup_pr)
+        if arg in ("-h", "--help")
+            opts.help = true
+        elseif arg in ("-v", "--version")
+            opts.version = needsarg(arg)
+        elseif arg in ("-r", "--repo")
+            opts.repo = needsarg(arg)
+        elseif arg in ("-n", "--dry-run")
+            opts.dry_run = true
+        elseif arg == "--no-fetch"
+            opts.fetch = false
+        elseif arg == "--no-update-pr"
+            opts.update_pr = false
+        elseif arg in ("-a", "--audit")
+            opts.audit = true
+        elseif arg == "--apply"
+            opts.apply = true
         elseif arg == "--cleanup-pr"
-            if i + 1 <= length(args)
-                options = CLIOptions(options.version, options.repo, options.help, options.dry_run, options.validate_branch, options.require_clean, options.test_commit, true, parse(Int, args[i+1]))
-                i += 1
-            else
-                error("--cleanup-pr requires a PR number")
-            end
+            opts.cleanup_pr = parse(Int, needsarg(arg))
+            opts.audit = true
         else
-            error("Unknown argument: $arg")
+            error("unknown argument: $arg (see --help)")
         end
         i += 1
     end
-
-    return options
+    return opts
 end
 
 function show_help()
-    println("Julia Backporter Tool")
-    println("====================")
-    println()
-    println("USAGE:")
-    println("  julia backporter.jl [OPTIONS]")
-    println()
-    println("OPTIONS:")
-    println("  -v, --version VERSION    Backport version (e.g., 1.11, 1.12)")
-    println("  -r, --repo REPO         Repository in format owner/name")
-    println("  -t, --test-commit HASH  Test backport of a single commit")
-    println("  -n, --dry-run           Show what would be done without making changes")
-    println("  --no-validate-branch    Skip branch name validation")
-    println("  --no-require-clean      Allow dirty working directory")
-    println("  -a, --audit             Run label audit mode (check backport labels)")
-    println("  --cleanup-pr NUMBER     Audit mode: process commits from a specific merged PR")
-    println("  -h, --help              Show this help message")
-    println()
-    println("MODES:")
-    println("  Default: Backport PRs with the backport label to the release branch")
-    println("  Audit (--audit): Identify PRs with stale backport labels")
-    println("  Cleanup (--cleanup-pr): Check backport labels for a specific merged PR")
-    println()
-    println("DEFAULTS:")
-    println("  Version is auto-detected from current branch name")
-    println("  Repository is auto-detected from git remote origin")
-    println()
-    println("ENVIRONMENT:")
-    println("  GITHUB_TOKEN                 GitHub personal access token (required)")
-    println()
-    println("EXAMPLES:")
-    println("  export GITHUB_TOKEN=ghp_xxxxxxxxxxxx")
-    println("  julia backporter.jl                    # Use auto-detected settings")
-    println("  julia backporter.jl -v 1.11            # Backport to version 1.11")
-    println("  julia backporter.jl -r myorg/julia     # Use custom repository")
-    println("  julia backporter.jl --dry-run          # Preview changes only")
-    println("  julia backporter.jl -t 89dfb68         # Test single commit backport")
-    println("  julia backporter.jl --audit            # Audit backport labels")
-    println("  julia backporter.jl --audit -v 1.11    # Audit specific version")
-    println("  julia backporter.jl --cleanup-pr 1234  # Check labels after PR merge")
+    print("""
+    Backporter — reconcile backport-labeled PRs with a backports branch.
+
+    USAGE:
+      julia backporter.jl [OPTIONS]              # from the root of a julia checkout
+
+    With backports-release-X.Y checked out, cherry-picks all pending labeled PRs,
+    reports the result, and updates the tracking PR body. From any other branch it
+    runs in report-only mode against origin/backports-release-X.Y (no picks), which
+    is also useful for refreshing the tracking PR after manual cherry-picks.
+
+    OPTIONS:
+      -v, --version X.Y     target version (default: detected from branch name)
+      -r, --repo OWNER/NAME repository (default: detected from origin remote)
+      -n, --dry-run         analyze and report only; no picks, no PR body update
+          --no-fetch        skip `git fetch origin`
+          --no-update-pr    don't touch the tracking PR body
+      -a, --audit           list labeled PRs whose backport already shipped on
+                            release-X.Y (their label can be removed)
+          --cleanup-pr N    audit against backports PR #N instead of release-X.Y
+          --apply           audit: actually remove the labels
+      -h, --help            show this help
+
+    EXAMPLES:
+      git switch backports-release-1.13 && julia backporter.jl
+      julia backporter.jl -n                  # preview only
+      julia backporter.jl --audit -v 1.13     # after a release: find stale labels
+      julia backporter.jl --audit -v 1.13 --apply
+    """)
 end
 
 # ============================================================================
-# Git Operations
+# Context detection
 # ============================================================================
-function cherry_picked_commits(version)
-    commits = Set{String}()
 
-    base = "origin/release-$version"
-    against = "backports-release-$version"
-
-    # Check if branches exist
-    if !success(`git rev-parse --verify $base`)
-        error("Base branch '$base' does not exist")
-    end
-    if !success(`git rev-parse --verify $against`)
-        error("Target branch '$against' does not exist")
-    end
-
-    try
-        # Get list of commit hashes first
-        hashes = readlines(`git log $base...$against --format=%H`)
-
-        # For each commit, get its full message and check for cherry-pick trailer
-        for hash in hashes
-            msg = read(`git log -1 --format=%B $hash`, String)
-            # Match cherry-pick trailer only at the end of lines (after newline or start)
-            # This avoids matching the pattern if it appears mid-sentence in the body
-            for match in eachmatch(r"(?:^|\n)\(cherry picked from commit ([a-f0-9]+)\)\s*$"m, msg)
-                push!(commits, match.captures[1])
-            end
-        end
-    catch e
-        error("Failed to get git log between $base and $against: $e")
-    end
-    return commits
-end
-
-function get_parents(hash::AbstractString)
-    try
-        result = read(`git rev-list --parents -n 1 $hash`, String)
-        return split(chomp(result))[2:end]
-    catch e
-        error("Failed to get parents for commit $hash: $e")
-    end
-end
-
-function get_real_hash(hash::AbstractString)
-    parents = get_parents(hash)
-    if length(parents) == 2  # It's a merge commit, use the second parent
-        hash = parents[2]
-    end
-    return hash
-end
-
-# Check if a PR's merge commit has been cherry-picked to the backport branch.
-# We check both the transformed hash (get_real_hash extracts the second parent
-# for merge commits) and the original merge_commit_sha, since someone
-# cherry-picking manually may use merge_commit_sha directly. See issue #15.
-function is_pr_backported(pr, already_backported_commits::Set{String})
-    return get_real_hash(pr.merge_commit_sha) in already_backported_commits ||
-           pr.merge_commit_sha in already_backported_commits
-end
-
-function is_working_directory_clean()
-    return success(`git diff --quiet`) && success(`git diff --cached --quiet`)
-end
-
-function validate_git_state(options::CLIOptions)
-    # Check if we're on the expected branch
-    if options.validate_branch
-        current_branch = branch()
-        expected_branch_pattern = r"^backports?-release-"
-        if !occursin(expected_branch_pattern, current_branch)
-            if options.dry_run
-                @warn "Current branch '$current_branch' doesn't match expected backport branch pattern."
-            else
-                @warn "Current branch '$current_branch' doesn't match expected backport branch pattern."
-                print("Continue anyway? (y/N): ")
-                response = readline()
-                if lowercase(strip(response)) != "y"
-                    error("Exiting due to unexpected branch name.")
-                end
-            end
-        end
-    end
-
-    # Check if working directory is clean
-    if options.require_clean && !is_working_directory_clean()
-        error("Working directory is not clean. Please commit or stash changes before running backporter.")
-    end
-end
-
-function fetch_and_rebase(config::BackportConfig, options::CLIOptions)
-    current_branch = branch()
-
-    println("Fetching latest changes from origin...")
-    if !success(`git fetch origin`)
-        error("Failed to fetch from origin")
-    end
-
-    # Check if the remote tracking branch exists
-    if !success(`git rev-parse --verify origin/$current_branch`)
-        println("Remote branch origin/$current_branch does not exist, skipping rebase")
-        return
-    end
-
-    # Check if rebase is needed by comparing HEAD with origin
-    println("Rebasing $current_branch onto origin/$current_branch...")
-    if !options.dry_run
-        # Check if we're already up-to-date
-        local_head = chomp(String(read(`git rev-parse HEAD`)))
-        remote_head = chomp(String(read(`git rev-parse origin/$current_branch`)))
-
-        if local_head == remote_head
-            println("Already up-to-date with origin/$current_branch")
-        elseif success(`git merge-base --is-ancestor origin/$current_branch HEAD`)
-            println("Local branch is ahead of origin/$current_branch, no rebase needed")
-        else
-            if !success(`git rebase origin/$current_branch`)
-                # Try to abort the rebase
-                try
-                    read(`git rebase --abort`)
-                catch
-                    # Ignore abort errors
-                end
-                error("Failed to rebase $current_branch onto origin/$current_branch. Please resolve conflicts manually.")
-            end
-            println("Successfully rebased onto origin/$current_branch")
-        end
-    else
-        println("[DRY RUN] Would rebase $current_branch onto origin/$current_branch")
-    end
-end
-
-function try_cherry_pick(hash::AbstractString)
-    if !success(`git cherry-pick -x $hash`)
-        # Check if the cherry-pick failed due to an empty commit (already backported)
-        try
-            status_output = read(`git status --porcelain`, String)
-            if isempty(strip(status_output))
-                # Working tree is clean, check if we're in a cherry-pick state with empty commit
-                try
-                    cherry_pick_head = read(`git rev-parse --verify CHERRY_PICK_HEAD`, String)
-                    if !isempty(strip(cherry_pick_head))
-                        # We're in cherry-pick state with empty commit - skip it and treat as success
-                        read(`git cherry-pick --skip`)
-                        println("  Skipped empty commit $hash (already backported)")
-                        return true
-                    end
-                catch
-                    # Not in cherry-pick state, proceed with merge commit check
-                end
-            end
-
-            # Check if this is a merge commit and try with -m 1
-            parents = get_parents(hash)
-            if length(parents) > 1
-                println("  Detected merge commit $hash, retrying with -m 1...")
-                read(`git cherry-pick --abort`)  # Clean up first
-                if success(`git cherry-pick -x $hash -m 1`)
-                    println("  Successfully cherry-picked merge commit $hash with -m 1")
-                    return true
-                else
-                    # Still failed even with -m 1, abort and return false
-                    try
-                        read(`git cherry-pick --abort`)
-                    catch e
-                        @warn "Failed to abort cherry-pick after -m 1 attempt: $e"
-                    end
-                    return false
-                end
-            end
-
-            # Regular failure case - abort the cherry-pick
-            read(`git cherry-pick --abort`)
-        catch e
-            @warn "Failed to abort cherry-pick: $e"
-        end
-        return false
-    end
-    return true
-end
-
-function branch()
-    try
-        return chomp(String(read(`git rev-parse --abbrev-ref HEAD`)))
-    catch e
-        error("Failed to get current branch: $e")
-    end
-end
+current_branch() = capture(`git rev-parse --abbrev-ref HEAD`)
+trunk_ref() = ref_exists("origin/master") ? "origin/master" : "origin/main"
+ref_exists(ref) = runok(`git rev-parse --verify --quiet $ref`)
+commit_exists(sha) = !isempty(sha) && runok(`git cat-file -e $(sha * "^{commit}")`)
 
 function detect_version_from_branch()
-    # Detect backport version from current branch name
-    current_branch = branch()
-
-    # Match patterns like: backports-release-1.11, backport-release-1.12, etc.
-    m = match(r"backports?-release-([0-9]+\.[0-9]+)", current_branch)
-    if m !== nothing
-        return m.captures[1]
-    end
-
-    # Match patterns like: release-1.11, release-1.12
-    m = match(r"release-([0-9]+\.[0-9]+)", current_branch)
-    if m !== nothing
-        return m.captures[1]
-    end
-
-    return nothing
+    b = current_branch()
+    m = match(r"backports?-release-(\d+\.\d+)", b)
+    m === nothing && (m = match(r"release-(\d+\.\d+)", b))
+    return m === nothing ? nothing : String(m.captures[1])
 end
 
 function detect_repo_from_remote()
-    # Detect repository from git remote origin
-    try
-        remote_url = chomp(String(read(`git remote get-url origin`)))
-
-        # Handle GitHub SSH URLs: git@github.com:owner/repo.git
-        m = match(r"git@github\.com:([^/]+/[^/]+)\.git", remote_url)
-        if m !== nothing
-            return m.captures[1]
-        end
-
-        # Handle GitHub HTTPS URLs: https://github.com/owner/repo.git
-        m = match(r"https:\/\/github\.com\/([\w]*?\/[\w]*?)(?:\.git)?$", remote_url)
-        if m !== nothing
-            return m.captures[1]
-        end
-
-        @warn "Could not parse repository from remote URL: $remote_url"
-        return nothing
-    catch e
-        @warn "Failed to get git remote origin: $e"
-        return nothing
-    end
+    r = runproc(`git remote get-url origin`)
+    r.ok || return nothing
+    m = match(r"github\.com[:/]([^/]+/[^/\s]+?)(?:\.git)?/?$", chomp(r.out))
+    return m === nothing ? nothing : String(m.captures[1])
 end
 
-function create_config_from_options(options::CLIOptions)
-    # Create BackportConfig from CLI options with smart defaults
-
-    # Determine version
-    version = options.version
-    if version === nothing
-        version = detect_version_from_branch()
-        if version === nothing
-            error("Could not detect version from branch name. Please specify with --version")
-        end
-        println("Auto-detected version: $version")
+function resolve_version(opts)
+    v = opts.version
+    if v === nothing
+        v = detect_version_from_branch()
+        v === nothing && error("could not detect version from branch '$(current_branch())'; pass --version X.Y")
+        println("Detected version: $v")
     end
+    occursin(r"^\d+\.\d+$", v) || error("invalid version '$v'; expected X.Y")
+    return v
+end
 
-    # Determine repository
-    repo = options.repo
+function resolve_repo(opts)
+    repo = opts.repo
     if repo === nothing
-        repo = detect_repo_from_remote()
-        if repo === nothing
-            repo = "JuliaLang/julia"  # fallback default
-            println("Using default repository: $repo")
-        else
-            println("Auto-detected repository: $repo")
-        end
+        repo = something(detect_repo_from_remote(), "JuliaLang/julia")
+        println("Repository: $repo")
     end
-
-    return BackportConfig(version, repo)
+    return repo
 end
 
 # ============================================================================
-# Data Structures
+# GitHub data
 # ============================================================================
 
-# GitHub authentication
-struct GitHubAuthenticator
-    auth::Ref{GitHub.Authorization}
-end
-GitHubAuthenticator() = GitHubAuthenticator(Ref{GitHub.Authorization}())
-
-function authenticate!(authenticator::GitHubAuthenticator, config::BackportConfig)
-    if !isassigned(authenticator.auth)
-        try
-            authenticator.auth[] = GitHub.authenticate(config.github_auth)
-        catch e
-            error("Failed to authenticate with GitHub: $e. Please check your GITHUB_TOKEN.")
-        end
-    end
-    return authenticator.auth[]
+struct PR
+    number::Int
+    state::String       # "OPEN" | "CLOSED" | "MERGED"
+    merged_at::String   # ISO8601 or ""
+    merge_commit::String
+    n_commits::Int
+    commit_shas::Vector{String}  # PR branch commits (up to 100)
+    url::String
+    title::String
 end
 
-function find_pr_associated_with_commit(hash::AbstractString, config::BackportConfig, auth::GitHubAuthenticator)
-    try
-        auth_ref = authenticate!(auth, config)
+const PR_QUERY = """
+query(\$searchQuery: String!, \$endCursor: String) {
+  search(query: \$searchQuery, type: ISSUE, first: 100, after: \$endCursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number title url state mergedAt
+        mergeCommit { oid }
+        commits(first: 100) { totalCount nodes { commit { oid } } }
+      }
+    }
+  }
+}
+"""
 
-        request_path = "/search/issues?q=$hash+type:pr+repo:$(config.repo)"
-        json = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
+const PR_JQ = raw""".data.search.nodes[] | [.number, .state, (.mergedAt // ""), (.mergeCommit.oid // ""), .commits.totalCount, (.commits.nodes | map(.commit.oid) | join(",")), .url, .title] | @tsv"""
 
-        if json["total_count"] !== 1
-            return nothing
-        end
-        item = only(json["items"])
-        if !haskey(item, "pull_request")
-            return nothing
-        end
+# Undo the escaping applied by jq's @tsv.
+untsv(s) = replace(s, "\\\\" => "\\", "\\t" => "\t", "\\n" => "\n", "\\r" => "\r")
 
-        pr = parse(Int, basename(item["pull_request"]["url"]))
-        return pr
-    catch e
-        @warn "Failed to find PR for commit $hash: $e"
-        return nothing
-    end
+function parse_pr_tsv(line::AbstractString)
+    f = split(line, '\t'; limit=8)
+    length(f) == 8 || error("unexpected search result line: $line")
+    shas = isempty(f[6]) ? String[] : String.(split(f[6], ','))
+    return PR(parse(Int, f[1]), String(f[2]), String(f[3]), String(f[4]),
+              parse(Int, f[5]), shas, String(f[7]), untsv(String(f[8])))
 end
 
-function was_squashed_pr(pr, config::BackportConfig, auth::GitHubAuthenticator)
-    parents = get_parents(pr.merge_commit_sha)
-    if length(parents) != 1
-        return false
-    end
-    return pr.number != find_pr_associated_with_commit(parents[1], config, auth)
+function fetch_labeled_prs(repo, label)
+    search = "repo:$repo is:pr label:\"$label\""
+    out = capture(`gh api graphql --paginate -f query=$PR_QUERY -f searchQuery=$search --jq $PR_JQ`)
+    prs = [parse_pr_tsv(l) for l in eachsplit(out, '\n') if !isempty(l)]
+    unique!(pr -> pr.number, prs)
+    return prs
 end
-
 
 # ============================================================================
-# GitHub API Functions
+# Backport signals: what is already on the branch?
 # ============================================================================
 
-function collect_label_prs(config::BackportConfig, auth::GitHubAuthenticator)
-    prs = []
-    page = 1
-    backport_label_encoded = replace(config.backport_label, " " => "+")
+struct Signals
+    prnums::Set{Int}         # PR numbers seen in commit subjects
+    trailer_shas::Set{String}# shas from "(cherry picked from commit ...)" trailers
+    patch_ids::Set{String}   # patch-ids of non-merge commits in the range
+end
+Signals() = Signals(Set{Int}(), Set{String}(), Set{String}())
 
-    while true
-        query = "repo:$(config.repo)+is:pr+label:%22$backport_label_encoded%22"
-        search_path = "/search/issues?q=$query&per_page=100&page=$page"
-        auth_ref = authenticate!(auth, config)
-
-        try
-            data = GitHub.gh_get_json(GitHub.DEFAULT_API, search_path; auth=auth_ref)
-            append!(prs, data["items"])
-
-            # Check if there are more pages
-            if !haskey(data, "items") || isempty(data["items"])
-                break
-            end
-            page += 1
-        catch e
-            error("Failed to fetch PRs from GitHub: $e")
-        end
+# PR numbers from a commit subject: the trailing "(#N)" run that GitHub's
+# squash-merge appends (a manual backport PR merged separately has two, e.g.
+# "Fix foo (#100) (#200)"), plus "Merge pull request #N" subjects. Mid-sentence
+# references like "fix regression from (#99)" are deliberately not matched.
+function subject_prnums(subject::AbstractString)
+    nums = Int[]
+    m = match(r"((?:\s*\(#\d+\))+)\s*$", subject)
+    if m !== nothing
+        append!(nums, parse(Int, x.captures[1]) for x in eachmatch(r"\(#(\d+)\)", m.captures[1]))
     end
-
-    # Filter and map to your desired structure if necessary
-    println("Fetching detailed PR information for $(length(prs)) PRs...")
-
-    # Fetch detailed PR information in parallel
-    pr_numbers = [pr_item["number"] for pr_item in prs]
-
-    if !isempty(pr_numbers)
-        println("Fetching $(length(pr_numbers)) PRs in parallel...")
-
-        # Fetch PRs in parallel using asyncmap
-        auth_ref = authenticate!(auth, config)
-        detailed_prs = asyncmap(pr_numbers; ntasks=min(20, length(pr_numbers))) do pr_number
-            try
-                GitHub.pull_request(config.repo, pr_number; auth=auth_ref)
-            catch e
-                @warn "Failed to fetch PR #$pr_number: $e"
-                nothing
-            end
-        end
-
-        # Filter out any failed fetches
-        return filter(pr -> pr !== nothing, detailed_prs)
-    else
-        return []
-    end
+    m = match(r"^Merge pull request #(\d+)", subject)
+    m === nothing || push!(nums, parse(Int, m.captures[1]))
+    return nums
 end
 
-function do_backporting(config::BackportConfig, auth::GitHubAuthenticator)
-    label_prs = collect_label_prs(config, auth)
-    _do_backporting(label_prs, config, auth)
+function trailer_shas(body::AbstractString)
+    return [String(m.captures[1]) for m in
+            eachmatch(r"^\(cherry picked from commit ([0-9a-f]{7,40})\)$"m, body)]
 end
 
-# Categorize PRs into: open, closed (unmerged), already backported, and candidates for backporting
-function categorize_prs(prs, config::BackportConfig)
-    already_backported_commits = cherry_picked_commits(config.backport_version)
-    open_prs = []
-    closed_prs = []
-    already_backported = []
-    backport_candidates = []
+function scan_signals(range::AbstractString)
+    s = Signals()
+    out = capture(`git log -z --format=%H%n%s%n%b $range`)
+    for entry in split(out, '\0'; keepempty=false)
+        lines = split(lstrip(entry, '\n'), '\n'; limit=3)
+        subject = length(lines) >= 2 ? lines[2] : ""
+        body = length(lines) >= 3 ? lines[3] : ""
+        union!(s.prnums, subject_prnums(subject))
+        union!(s.trailer_shas, trailer_shas(body))
+    end
+    r = runproc(pipeline(`git log -p --no-merges $range`, `git patch-id --stable`))
+    r.ok || error("failed to compute patch-ids for $range:\n$(r.err)")
+    for line in eachsplit(r.out, '\n'; keepempty=false)
+        push!(s.patch_ids, String(first(eachsplit(line, ' '))))
+    end
+    return s
+end
 
+function matches_trailer(s::Signals, shas)
+    for t in s.trailer_shas, sha in shas
+        startswith(sha, t) && return true
+    end
+    return false
+end
+
+function is_backported_fast(pr::PR, s::Signals)
+    pr.number in s.prnums && return true
+    shas = copy(pr.commit_shas)
+    isempty(pr.merge_commit) || push!(shas, pr.merge_commit)
+    return matches_trailer(s, shas)
+end
+
+nparents(sha) = length(split(capture(`git rev-list --parents -n 1 $sha`))) - 1
+
+function patch_id_of(sha)
+    r = runproc(pipeline(`git diff-tree -p $sha`, `git patch-id --stable`))
+    (r.ok && !isempty(strip(r.out))) || return nothing
+    return String(first(eachsplit(r.out, ' ')))
+end
+
+# The commits whose diffs could appear verbatim on the backport branch: the merge
+# commit itself for squash/rebase merges, the individual PR commits otherwise.
+function effective_shas(pr::PR)
+    commit_exists(pr.merge_commit) || return String[]
+    nparents(pr.merge_commit) == 1 && return [pr.merge_commit]
+    return filter(commit_exists, pr.commit_shas)
+end
+
+function is_backported(pr::PR, s::Signals)
+    is_backported_fast(pr, s) && return true
+    return any(sha -> patch_id_of(sha) in s.patch_ids, effective_shas(pr))
+end
+
+# ============================================================================
+# Categorization
+# ============================================================================
+
+struct Buckets
+    open::Vector{PR}
+    unmerged::Vector{PR}    # closed without merging
+    backported::Vector{PR}
+    pending::Vector{PR}
+end
+
+function categorize(prs, s::Signals; backported_pred=is_backported)
+    b = Buckets(PR[], PR[], PR[], PR[])
     for pr in prs
-        if pr.state != "closed"
-            push!(open_prs, pr)
+        if pr.state == "OPEN"
+            push!(b.open, pr)
+        elseif pr.state == "CLOSED"
+            push!(b.unmerged, pr)
+        elseif backported_pred(pr, s)
+            push!(b.backported, pr)
         else
-            if pr.merged_at === nothing
-                push!(closed_prs, pr)
-            elseif is_pr_backported(pr, already_backported_commits)
-                push!(already_backported, pr)
-            else
-                push!(backport_candidates, pr)
-            end
+            push!(b.pending, pr)
         end
     end
-
-    return (; open_prs, closed_prs, already_backported, backport_candidates)
+    sort!(b.open; by=pr -> pr.number)
+    sort!(b.unmerged; by=pr -> pr.number)
+    sort!(b.backported; by=pr -> (pr.merged_at, pr.number))
+    sort!(b.pending; by=pr -> (pr.merged_at, pr.number))
+    return b
 end
 
-function _do_backporting_analysis(prs, config::BackportConfig, auth::GitHubAuthenticator)
-    # Analyze PRs without making changes (for dry-run mode)
-    (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
+# ============================================================================
+# Cherry-picking
+# ============================================================================
 
-    println("Analysis Results:")
-    println("  Open PRs: $(length(open_prs))")
-    println("  Closed/unmerged PRs: $(length(closed_prs))")
-    println("  Already backported: $(length(already_backported))")
-    println("  Backport candidates: $(length(backport_candidates))")
+worktree_clean() = runok(`git diff --quiet`) && runok(`git diff --cached --quiet`)
 
-    # Show what would be done without actually doing it
-    if !isempty(backport_candidates)
-        println("\n[DRY RUN] Would attempt to backport:")
-        for pr in backport_candidates
-            println("  - #$(pr.number): $(pr.title)")
-        end
+function sync_branch!(branch, opts)
+    ref_exists("origin/$branch") || return
+    local_head = capture(`git rev-parse HEAD`)
+    remote_head = capture(`git rev-parse origin/$branch`)
+    local_head == remote_head && return
+    if runok(`git merge-base --is-ancestor origin/$branch HEAD`)
+        println("Local $branch is ahead of origin.")
+    elseif runok(`git merge-base --is-ancestor HEAD origin/$branch`)
+        opts.dry_run || capture(`git merge --ff-only origin/$branch`)
+        println("Fast-forwarded $branch to origin.")
+    elseif opts.dry_run
+        println("Note: $branch and origin/$branch have diverged.")
+    elseif runok(`git rebase origin/$branch`)
+        println("Rebased $branch onto origin/$branch.")
+    else
+        runproc(`git rebase --abort`)
+        error("failed to rebase $branch onto origin/$branch; resolve manually")
     end
 end
 
-function test_single_commit(commit_hash::String, options::CLIOptions)
-    println("Testing backport of single commit: $commit_hash")
+# Returns (sha, mainline::Bool) or nothing if the commit is missing locally.
+function pick_plan(pr::PR)
+    commit_exists(pr.merge_commit) || return nothing
+    nparents(pr.merge_commit) == 1 && return (pr.merge_commit, false)
+    if pr.n_commits == 1 && length(pr.commit_shas) == 1 && commit_exists(pr.commit_shas[1])
+        return (pr.commit_shas[1], false)
+    end
+    return (pr.merge_commit, true)  # multi-commit merge: apply as one squashed commit
+end
 
-    if options.dry_run
-        println("[DRY RUN] Would attempt to cherry-pick commit $commit_hash")
+function try_cherry_pick(sha; mainline::Bool=false)
+    cmd = mainline ? `git cherry-pick -x -m 1 $sha` : `git cherry-pick -x $sha`
+    r = runproc(cmd)
+    r.ok && return :picked
+    if runok(`git rev-parse --verify --quiet CHERRY_PICK_HEAD`) && worktree_clean()
+        runproc(`git cherry-pick --skip`)
+        return :empty  # patch already present on the branch
+    end
+    runproc(`git cherry-pick --abort`)
+    return :conflict
+end
+
+struct PickResults
+    picked::Vector{PR}
+    squashed::Vector{PR}          # multi-commit merges applied via -m 1
+    empty::Vector{PR}             # pick came up empty: already applied
+    failed::Vector{Tuple{PR,String}}  # (pr, command to run manually)
+end
+PickResults() = PickResults(PR[], PR[], PR[], Tuple{PR,String}[])
+
+function pick_all!(pending::Vector{PR})
+    res = PickResults()
+    for pr in pending
+        plan = pick_plan(pr)
+        if plan === nothing
+            push!(res.failed, (pr, "# merge commit $(pr.merge_commit) not found locally; git fetch origin"))
+            continue
+        end
+        sha, mainline = plan
+        manual = mainline ? "git cherry-pick -x -m 1 $sha" : "git cherry-pick -x $sha"
+        status = try_cherry_pick(sha; mainline)
+        if status == :picked
+            push!(mainline ? res.squashed : res.picked, pr)
+        elseif status == :empty
+            push!(res.empty, pr)
+        else
+            push!(res.failed, (pr, manual))
+        end
+    end
+    return res
+end
+
+# ============================================================================
+# Reporting and the tracking PR body
+# ============================================================================
+
+const MARK_BEGIN = "<!-- BACKPORTER:BEGIN -->"
+const MARK_END = "<!-- BACKPORTER:END -->"
+
+sanitize_title(t) = replace(t, "-->" => "→")
+
+function checklist(io, header, prs; checked::Bool)
+    isempty(prs) && return
+    println(io, header)
+    for pr in prs
+        println(io, "- [", checked ? "x" : " ", "] #", pr.number, " <!-- ", sanitize_title(pr.title), " -->")
+    end
+    println(io)
+end
+
+function build_comment(; backported=PR[], manual=PR[], pending=PR[], open=PR[])
+    io = IOBuffer()
+    checklist(io, "Backported PRs:", backported; checked=true)
+    checklist(io, "Need manual backport:", manual; checked=false)
+    checklist(io, "To be backported:", pending; checked=false)
+    checklist(io, "Non-merged PRs with backport label:", open; checked=false)
+    ts = Dates.format(now(UTC), dateformat"yyyy-mm-dd HH:MM")
+    print(io, "_Updated $ts UTC by [Backporter](https://github.com/KristofferC/Backporter)._")
+    return String(take!(io))
+end
+
+function replace_marked_section(body::AbstractString, section::AbstractString)
+    b = replace(body, "\r\n" => "\n")
+    wrapped = string(MARK_BEGIN, '\n', strip(section), '\n', MARK_END)
+    i = findfirst(MARK_BEGIN, b)
+    j = findlast(MARK_END, b)
+    if i === nothing || j === nothing || first(i) > first(j)
+        isempty(strip(b)) && return wrapped
+        return string(rstrip(b), "\n\n", wrapped)
+    end
+    return string(b[1:prevind(b, first(i))], wrapped, b[last(j)+1:end])
+end
+
+function urlencode(s::AbstractString)
+    io = IOBuffer()
+    for b in codeunits(s)
+        c = Char(b)
+        if c in 'a':'z' || c in 'A':'Z' || c in '0':'9' || c in "-._~"
+            write(io, c)
+        else
+            print(io, '%', uppercase(string(b; base=16, pad=2)))
+        end
+    end
+    return String(take!(io))
+end
+
+function find_tracking_pr(repo, branch)
+    out = capture(`gh pr list -R $repo --head $branch --state open --json number --jq ".[0].number // empty"`)
+    return isempty(strip(out)) ? nothing : parse(Int, strip(out))
+end
+
+strip_timestamp(s) = replace(s, r"^_Updated .* by \[Backporter\].*$"m => "")
+
+function update_tracking_pr(repo, prnum, section)
+    body = capture(`gh api repos/$repo/pulls/$prnum --jq ".body // \"\""`)
+    new_body = replace_marked_section(body, section)
+    if strip_timestamp(new_body) == strip_timestamp(replace(body, "\r\n" => "\n"))
+        println("Tracking PR #$prnum is already up to date.")
         return
     end
-
-    if try_cherry_pick(commit_hash)
-        println("✓ Successfully backported commit $commit_hash")
-    else
-        println("✗ Failed to backport commit $commit_hash")
+    path, io = mktemp()
+    try
+        write(io, new_body)
+        close(io)
+        # REST, not `gh pr edit`: the latter runs a GraphQL metadata query that
+        # requires the read:org token scope.
+        capture(`gh api -X PATCH repos/$repo/pulls/$prnum -F body=@$path`)
+    finally
+        rm(path; force=true)
     end
+    printstyled("Updated body of tracking PR #$prnum.\n"; color=:green)
 end
 
-function _do_backporting(prs, config::BackportConfig, auth::GitHubAuthenticator)
-    (; open_prs, closed_prs, already_backported, backport_candidates) = categorize_prs(prs, config)
-
-    sort!(closed_prs; by = x -> x.number)
-    sort!(already_backported; by = x -> x.merged_at)
-    sort!(backport_candidates; by = x -> x.merged_at)
-
-    failed_backports = []
-    successful_backports = []
-    multi_commit_prs = []
-    for pr in backport_candidates
-        if pr.commits === nothing
-            # Handle case where commits field is missing - refetch PR
-            i = findfirst(x -> x.number == pr.number, prs)
-            pr = GitHub.pull_request(config.repo, pr.number; auth=authenticate!(auth, config))
-            @assert pr.commits !== nothing
-            prs[i] = pr
-        end
-        if pr.commits != 1
-            # Check if this was squashed - we can still backport squashed PRs
-            if was_squashed_pr(pr, config, auth) && try_cherry_pick(get_real_hash(pr.merge_commit_sha))
-                push!(successful_backports, pr)
-            else
-                push!(multi_commit_prs, pr)
-            end
-        elseif try_cherry_pick(get_real_hash(pr.merge_commit_sha))
-            push!(successful_backports, pr)
-        else
-            push!(failed_backports, pr)
-        end
+function print_pr_list(header, prs; color=:normal, extra=pr -> "")
+    isempty(prs) && return
+    printstyled(header, '\n'; bold=true, color=color)
+    for pr in prs
+        println("    #", pr.number, " — ", pr.title, "  ", pr.url, extra(pr))
     end
-
-    # Output results and recommendations
-
-    remove_label_prs = [closed_prs; already_backported]
-    if !isempty(remove_label_prs)
-        sort!(remove_label_prs; by = x -> (x.merged_at == nothing ? now() : x.merged_at))
-        println("The following PRs are closed or already backported but still has a backport label, remove the label:")
-        # https://github.com/KristofferC/Backporter/issues/11
-        println("(don't remove the label until you have merged the backports PR)")
-        for pr in remove_label_prs
-            println("    #$(pr.number) - $(pr.html_url)")
-        end
-        println()
-    end
-
-    if !isempty(open_prs)
-        println("The following PRs are open but have a backport label, merge first?")
-        for pr in open_prs
-            println("    #$(pr.number) - $(pr.html_url)")
-        end
-        println()
-    end
-
-
-    if !isempty(failed_backports)
-        println("The following PRs failed to backport cleanly, manually backport:")
-        for pr in failed_backports
-            println("    #$(pr.number) - $(pr.html_url) - $(pr.merge_commit_sha)")
-        end
-        println()
-    end
-
-    if !isempty(multi_commit_prs)
-        println("The following PRs had multiple commits, manually backport")
-        for pr in multi_commit_prs
-            println("    #$(pr.number) - $(pr.html_url)")
-        end
-        println()
-    end
-
-    if !isempty(successful_backports)
-        println("The following PRs were backported to this branch:")
-        for pr in successful_backports
-            println("    #$(pr.number) - $(pr.html_url)")
-        end
-        printstyled("Push the updated branch"; bold=true)
-        println()
-    end
-
-    println("Update the first post with:")
-
-    function summarize_pr(pr; checked=true)
-        println("- [$(checked ? "x" : " ")] #$(pr.number) <!-- $(pr.title) -->")
-    end
-
-    backported_prs = [successful_backports; already_backported]
-    if !isempty(backported_prs)
-        sort!(backported_prs; by = x -> x.merged_at)
-        println("Backported PRs:")
-        for pr in backported_prs
-            summarize_pr(pr)
-        end
-    end
-
-    if !isempty(failed_backports)
-        println()
-        println("Need manual backport:")
-        for pr in failed_backports
-            summarize_pr(pr; checked=false)
-        end
-    end
-
-    if !isempty(multi_commit_prs)
-        println()
-        println("Contains multiple commits, manual intervention needed:")
-        for pr in multi_commit_prs
-            summarize_pr(pr; checked=false)
-        end
-    end
-
-    if !isempty(open_prs)
-        println()
-        println("Non-merged PRs with backport label:")
-        for pr in open_prs
-            summarize_pr(pr; checked=false)
-        end
-    end
+    println()
 end
 
 # ============================================================================
-# Label Audit Functions
+# Default mode
 # ============================================================================
 
-struct LabelAuditConfig
-    version::String
-    repo::String
-    github_auth::String
-    backport_label::String
-    release_branch::String
-end
+function run_backport(opts::Options)
+    version = resolve_version(opts)
+    repo = resolve_repo(opts)
+    label = "backport $version"
+    bp_branch = "backports-release-$version"
+    release_ref = "origin/release-$version"
 
-function LabelAuditConfig(version::String, repo::String)
-    github_auth = get(ENV, "GITHUB_TOKEN", "")
-    if isempty(github_auth)
-        error("GITHUB_TOKEN environment variable must be set")
+    if opts.fetch
+        println("Fetching origin...")
+        capture(`git fetch origin`)
     end
-    backport_label = "backport $version"
-    release_branch = "release-$version"
-    LabelAuditConfig(version, repo, github_auth, backport_label, release_branch)
-end
+    ref_exists(release_ref) || error("$release_ref does not exist")
 
-function get_github_auth(auth::String)
-    return GitHub.authenticate(auth)
-end
-
-function find_backport_versions(repo::String, github_auth::String)
-    versions = String[]
-    println("Discovering backport labels...")
-
-    page = 1
-    while true
-        auth_ref = get_github_auth(github_auth)
-        request_path = "/repos/$repo/labels?per_page=100&page=$page"
-        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
-
-        isempty(data) && break
-
-        for label in data
-            name = label["name"]
-            m = match(r"^backport (\d+\.\d+)$", name)
-            if m !== nothing
-                push!(versions, m.captures[1])
-            end
-        end
-
-        page += 1
-    end
-
-    sort!(versions; by=v -> VersionNumber(v), rev=true)
-    return versions
-end
-
-struct CommitInfo
-    sha::String
-    backport_pr::Union{Int,Nothing}
-end
-
-function extract_pr_numbers_from_message(message::String)
-    prs = Int[]
-    for m in eachmatch(r"\(#(\d+)\)", message)
-        push!(prs, parse(Int, m.captures[1]))
-    end
-    return prs
-end
-
-function extract_merge_pr_from_message(message::String)
-    m = match(r"Merge pull request #(\d+)", message)
-    m !== nothing && return parse(Int, m.captures[1])
-    return nothing
-end
-
-function clone_repo_to_temp(config::LabelAuditConfig)
-    temp_dir = mktempdir()
-    repo_url = "https://github.com/$(config.repo).git"
-
-    println("Cloning $(config.repo) to temporary directory...")
-    if !success(`git clone --filter=blob:none --no-checkout $repo_url $temp_dir`)
-        rm(temp_dir; force=true, recursive=true)
-        error("Failed to clone repository $(config.repo)")
-    end
-
-    return temp_dir
-end
-
-function get_commits_from_branch(config::LabelAuditConfig)
-    temp_dir = clone_repo_to_temp(config)
-
-    try
-        println("Fetching $(config.release_branch)...")
-        if !success(`git -C $temp_dir fetch origin $(config.release_branch)`)
-            error("Failed to fetch $(config.release_branch)")
-        end
-
-        return parse_git_log_for_commits(temp_dir, "origin/$(config.release_branch)")
-    finally
-        rm(temp_dir; force=true, recursive=true)
-    end
-end
-
-function get_commits_from_pr(config::LabelAuditConfig, pr_number::Int)
-    temp_dir = clone_repo_to_temp(config)
-
-    try
-        println("Fetching PR #$pr_number...")
-        if !success(`git -C $temp_dir fetch origin pull/$pr_number/head:pr-$pr_number`)
-            error("Failed to fetch PR #$pr_number")
-        end
-
-        return parse_git_log_for_commits(temp_dir, "pr-$pr_number"; backport_pr=pr_number)
-    finally
-        rm(temp_dir; force=true, recursive=true)
-    end
-end
-
-function parse_git_log_for_commits(repo_dir::String, ref::String; backport_pr::Union{Int,Nothing}=nothing)
-    commits = Dict{Int,CommitInfo}()
-    current_backport_pr = backport_pr
-
-    println("Parsing git log from $ref...")
-    log_output = read(`git -C $repo_dir log --format=%H%n%B%n---COMMIT_SEPARATOR--- $ref`, String)
-
-    for commit_block in split(log_output, "---COMMIT_SEPARATOR---")
-        commit_block = strip(commit_block)
-        isempty(commit_block) && continue
-
-        lines = split(commit_block, '\n')
-        isempty(lines) && continue
-
-        sha = strip(lines[1])
-        message = join(lines[2:end], '\n')
-
-        if backport_pr === nothing
-            merge_pr = extract_merge_pr_from_message(message)
-            if merge_pr !== nothing
-                current_backport_pr = merge_pr
-            end
-        end
-
-        for pr_num in extract_pr_numbers_from_message(message)
-            if !haskey(commits, pr_num)
-                commits[pr_num] = CommitInfo(sha, current_backport_pr)
-            end
-        end
-    end
-
-    return commits
-end
-
-function get_labeled_closed_prs(config::LabelAuditConfig)
-    prs = []
-
-    println("Fetching closed PRs with label $(config.backport_label)...")
-
-    page = 1
-    while true
-        auth_ref = get_github_auth(config.github_auth)
-        query = URIs.escapeuri("repo:$(config.repo) is:pr is:closed label:\"$(config.backport_label)\"")
-        request_path = "/search/issues?q=$query&per_page=100&page=$page"
-        data = GitHub.gh_get_json(GitHub.DEFAULT_API, request_path; auth=auth_ref)
-
-        items = get(data, "items", [])
-        isempty(items) && break
-
-        for item in items
-            haskey(item, "pull_request") && push!(prs, item)
-        end
-
-        page += 1
-    end
-
-    return prs
-end
-
-function remove_backport_label(config::LabelAuditConfig, pr_number::Int)
-    auth_ref = get_github_auth(config.github_auth)
-    encoded_label = URIs.escapeuri(config.backport_label)
-    request_path = "/repos/$(config.repo)/issues/$pr_number/labels/$encoded_label"
-    GitHub.gh_delete(GitHub.DEFAULT_API, request_path; auth=auth_ref)
-end
-
-struct AuditResult
-    to_remove::Vector{Tuple{Int,String,CommitInfo}}
-    to_keep::Vector{Tuple{Int,String}}
-end
-
-function audit_labels(config::LabelAuditConfig; pr_commits::Union{Dict{Int,CommitInfo},Nothing}=nothing)
-    commits = if pr_commits !== nothing
-        pr_commits
+    on_branch = current_branch() == bp_branch
+    if on_branch
+        sync_branch!(bp_branch, opts)
+        ref = "HEAD"
+    elseif ref_exists("origin/$bp_branch")
+        ref = "origin/$bp_branch"
+        println("Not on $bp_branch: report-only mode (no cherry-picks) against $ref.")
     else
-        get_commits_from_branch(config)
+        error("$bp_branch is not checked out and origin/$bp_branch does not exist; create the branch first")
+    end
+    pick_mode = on_branch && !opts.dry_run
+    if pick_mode && !worktree_clean()
+        error("working tree is not clean; commit or stash before cherry-picking")
     end
 
-    println("Found $(length(commits)) cherry-picked PRs")
+    println("Searching $repo for PRs labeled \"$label\"...")
+    prs = fetch_labeled_prs(repo, label)
+    println("Found $(length(prs)) labeled PRs.")
 
-    labeled_prs = get_labeled_closed_prs(config)
-    println("Found $(length(labeled_prs)) closed PRs with label $(config.backport_label)")
-
-    to_remove = Tuple{Int,String,CommitInfo}[]
-    to_keep = Tuple{Int,String}[]
-
-    for pr in labeled_prs
-        pr_num = pr["number"]
-        title = pr["title"]
-
-        if haskey(commits, pr_num)
-            push!(to_remove, (pr_num, title, commits[pr_num]))
+    # A labeled PR may have shipped in a previous backport round: its commits are
+    # then on release-X.Y itself, not in the current branch range. Classify those
+    # separately so they are never re-suggested.
+    released_signals = scan_signals("$(trunk_ref())..$release_ref")
+    released = PR[]
+    rest = PR[]
+    for pr in prs
+        if pr.state == "MERGED" && is_backported(pr, released_signals)
+            push!(released, pr)
         else
-            push!(to_keep, (pr_num, title))
+            push!(rest, pr)
         end
     end
+    sort!(released; by=pr -> pr.number)
 
-    return AuditResult(to_remove, to_keep)
-end
+    signals = scan_signals("$release_ref..$ref")
+    b = categorize(rest, signals)
 
-function format_backport_info(info::CommitInfo)
-    bp_str = info.backport_pr !== nothing ? " via #$(info.backport_pr)" : ""
-    return "$(info.sha[1:7])$bp_str"
-end
+    manual = PR[]
+    pending = PR[]
+    backported = copy(b.backported)
+    if pick_mode
+        res = pick_all!(b.pending)
+        append!(backported, res.picked, res.squashed, res.empty)
+        sort!(backported; by=pr -> (pr.merged_at, pr.number))
+        append!(manual, first.(res.failed))
 
-function print_audit_results(result::AuditResult, config::LabelAuditConfig)
-    println()
-    println("=== PRs already backported (label should be removed) ===")
-    if isempty(result.to_remove)
-        println("None")
-    else
-        for (pr_num, title, info) in result.to_remove
-            println("  #$pr_num: $title ($(format_backport_info(info)))")
-        end
-    end
-
-    println()
-    println("=== PRs still needing backport (label should remain) ===")
-    if isempty(result.to_keep)
-        println("None")
-    else
-        for (pr_num, title) in result.to_keep
-            println("  #$pr_num: $title")
-        end
-    end
-    println()
-end
-
-function apply_audit_changes(result::AuditResult, config::LabelAuditConfig)
-    if isempty(result.to_remove)
-        println("No labels to remove")
-        return
-    end
-
-    println("Removing labels...")
-    for (pr_num, title, info) in result.to_remove
-        try
-            remove_backport_label(config, pr_num)
-            println("  Removed label from #$pr_num")
-        catch e
-            println("  Error processing #$pr_num: $e")
-        end
-    end
-
-    println()
-    println("Done. Removed $(config.backport_label) from $(length(result.to_remove)) PR(s)")
-end
-
-function run_audit_for_version(version::String, repo::String, dry_run::Bool, cleanup_pr::Union{Int,Nothing})
-    if !occursin(r"^\d+\.\d+$", version)
-        error("Invalid version format: $version. Expected X.Y (e.g., 1.13)")
-    end
-
-    config = LabelAuditConfig(version, repo)
-
-    println("Backport Label Audit")
-    println("====================")
-    println("Version: $(config.version)")
-    println("Repository: $(config.repo)")
-    println("Label: $(config.backport_label)")
-    println("Branch: $(config.release_branch)")
-    println("Dry run: $dry_run")
-    println()
-
-    if cleanup_pr !== nothing
-        pr_commits = get_commits_from_pr(config, cleanup_pr)
-        if isempty(pr_commits)
-            println("No cherry-picked PRs found in PR #$cleanup_pr")
-            return
-        end
-        println("Found cherry-picked PRs: $(join(keys(pr_commits), ", "))")
-        result = audit_labels(config; pr_commits=pr_commits)
-        print_audit_results(result, config)
-        if !dry_run
-            apply_audit_changes(result, config)
-        else
-            println("Dry run mode - no changes made")
-            if !isempty(result.to_remove)
-                println("Would remove $(config.backport_label) from $(length(result.to_remove)) PR(s)")
+        print_pr_list("Cherry-picked now:", [res.picked; res.squashed]; color=:green,
+                      extra=pr -> pr in res.squashed ? "  (multi-commit merge, applied as one squashed commit)" : "")
+        print_pr_list("Pick came up empty (already applied):", res.empty)
+        if !isempty(res.failed)
+            printstyled("Failed to cherry-pick cleanly — backport manually:\n"; bold=true, color=:red)
+            for (pr, cmd) in res.failed
+                println("    #", pr.number, " — ", pr.title, "  ", pr.url)
+                println("        ", cmd)
             end
-        end
-    else
-        result = audit_labels(config)
-        print_audit_results(result, config)
-
-        if dry_run
-            println("Dry run mode - no changes made")
-            if !isempty(result.to_remove)
-                println("Would remove $(config.backport_label) from $(length(result.to_remove)) PR(s)")
-            end
-        else
-            apply_audit_changes(result, config)
-        end
-    end
-end
-
-function run_audit_mode(options::CLIOptions)
-    repo = options.repo
-    if repo === nothing
-        repo = detect_repo_from_remote()
-        if repo === nothing
-            error("Could not detect repository. Please specify with --repo")
-        end
-        println("Auto-detected repository: $repo")
-    end
-
-    if options.version !== nothing
-        run_audit_for_version(options.version, repo, options.dry_run, options.cleanup_pr)
-    else
-        if options.cleanup_pr !== nothing
-            error("--cleanup-pr requires --version to be specified")
-        end
-
-        github_auth = get(ENV, "GITHUB_TOKEN", "")
-        if isempty(github_auth)
-            error("GITHUB_TOKEN environment variable must be set")
-        end
-
-        versions = find_backport_versions(repo, github_auth)
-
-        if isempty(versions)
-            println("No backport labels found in $repo")
-            return
-        end
-
-        println("Found $(length(versions)) backport label(s): $(join(versions, ", "))")
-        println()
-
-        for version in versions
-            run_audit_for_version(version, repo, options.dry_run, nothing)
-            println()
-            println(repeat("=", 60))
             println()
         end
+    else
+        append!(pending, b.pending)
+        print_pr_list("To be backported (not attempted in report-only/dry-run mode):", pending)
+    end
+
+    print_pr_list("Open PRs with the label (merge first?):", b.open)
+    print_pr_list("Already released on release-$version but still labeled (run --audit --apply):", released; color=:yellow)
+    print_pr_list("Closed without merging but still labeled (remove the label):", b.unmerged; color=:yellow)
+    already_console = filter(pr -> !isempty(pr.merged_at), b.backported)
+    if !isempty(already_console)
+        println("$(length(already_console)) labeled PRs are already on the branch ",
+                "(run --audit after release to clear their labels).")
+        println()
+    end
+
+    section = build_comment(; backported, manual, pending, open=b.open)
+    if opts.dry_run || !opts.update_pr
+        println("Tracking PR section (not applied):\n")
+        println(section)
+    else
+        tp = find_tracking_pr(repo, bp_branch)
+        if tp === nothing
+            println("No open PR found with head $bp_branch; paste this into its body once it exists:\n")
+            println(section)
+        else
+            update_tracking_pr(repo, tp, section)
+        end
+    end
+
+    if pick_mode && capture(`git rev-parse HEAD`) != capture(`git rev-parse origin/$bp_branch`)
+        printstyled("\nLocal $bp_branch differs from origin — review and push:\n"; bold=true)
+        println("    git push origin $bp_branch")
     end
 end
 
 # ============================================================================
-# Main Entry Point
+# Audit mode
+# ============================================================================
+
+function run_audit(opts::Options)
+    version = resolve_version(opts)
+    repo = resolve_repo(opts)
+    label = "backport $version"
+
+    if opts.fetch
+        println("Fetching origin...")
+        capture(`git fetch origin`)
+    end
+
+    if opts.cleanup_pr !== nothing
+        println("Auditing against backports PR #$(opts.cleanup_pr)...")
+        capture(`git fetch origin pull/$(opts.cleanup_pr)/head`)
+        range = "$(trunk_ref())..FETCH_HEAD"
+    else
+        ref_exists("origin/release-$version") || error("origin/release-$version does not exist")
+        range = "$(trunk_ref())..origin/release-$version"
+    end
+
+    println("Searching $repo for PRs labeled \"$label\"...")
+    prs = fetch_labeled_prs(repo, label)
+    signals = scan_signals(range)
+
+    released = PR[]
+    kept = PR[]
+    for pr in prs
+        pr.state == "MERGED" || continue
+        push!(is_backported(pr, signals) ? released : kept, pr)
+    end
+    sort!(released; by=pr -> pr.number)
+    sort!(kept; by=pr -> pr.number)
+
+    print_pr_list("Backport has shipped — label can be removed:", released; color=:green)
+    print_pr_list("Not found in $range — label stays:", kept)
+
+    if isempty(released)
+        println("Nothing to clean up.")
+    elseif opts.apply
+        for pr in released
+            capture(`gh api -X DELETE repos/$repo/issues/$(pr.number)/labels/$(urlencode(label))`)
+            println("Removed \"$label\" from #$(pr.number)")
+        end
+    else
+        println("Re-run with --apply to remove the label from $(length(released)) PR(s).")
+    end
+end
+
+# ============================================================================
+# Entry point
 # ============================================================================
 
 function main(args)
-    # Parse command line arguments
-    options = parse_cli_args(args)
-
-    if options.help
+    opts = parse_cli_args(args)
+    if opts.help
         show_help()
         return
     end
-
-    # Validate environment
-    if !ispath(".git")
-        error("This script must be run from the root of a git repository")
-    end
-
-    # Handle audit mode
-    if options.audit || options.cleanup_pr !== nothing
-        println("Backport Label Audit Tool")
-        println("=========================\n")
-        run_audit_mode(options)
-        return
-    end
-
-    println("Julia Backporter Tool")
-    println("======================\n")
-
-    # Validate git state (branch name, clean working directory)
-    validate_git_state(options)
-
-    # Create configuration from CLI options and smart defaults
-    config = create_config_from_options(options)
-
-    # Fetch and rebase before starting
-    fetch_and_rebase(config, options)
-
-    current_branch = branch()
-
-    println("Configuration:")
-    println("  Target version: $(config.backport_version)")
-    println("  Repository: $(config.repo)")
-    println("  Label: $(config.backport_label)")
-    println("  Current branch: $current_branch")
-    if options.dry_run
-        println("  Mode: DRY RUN (no changes will be made)")
-    end
-    if !options.validate_branch
-        println("  Branch validation: DISABLED")
-    end
-    if !options.require_clean
-        println("  Clean directory check: DISABLED")
-    end
-    println()
-
-    # Check if we're in single commit test mode
-    if options.test_commit !== nothing
-        println("Single commit test mode")
-        test_single_commit(options.test_commit, options)
-        return
-    end
-
-    try
-        auth = GitHubAuthenticator()
-        start_time = time()
-        prs = collect_label_prs(config, auth)
-        println("Collected $(length(prs)) PRs in $(round(time() - start_time, digits=1))s")
-
-        if options.dry_run
-            println("\n[DRY RUN] Would perform backporting operations for $(length(prs)) PRs")
-            # Still show the analysis but don't actually cherry-pick
-            _do_backporting_analysis(prs, config, auth)
-        else
-            _do_backporting(prs, config, auth)
-        end
-
-        total_time = time() - start_time
-        println("\nBackport process completed in $(round(total_time, digits=1))s")
-    catch e
-        error("Backporting failed: $e")
-    end
+    runok(`git rev-parse --git-dir`) || error("run this from inside a git repository")
+    Sys.which("gh") === nothing && error("the GitHub CLI (gh) is required: https://cli.github.com")
+    opts.audit ? run_audit(opts) : run_backport(opts)
 end
 
-# Only run main if this file is being executed directly (not included)
 if abspath(PROGRAM_FILE) == @__FILE__
     main(ARGS)
 end
